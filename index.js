@@ -234,6 +234,11 @@ const videoId = req.params.id;
 try {
 let videoData = null;
 let commentsData = { commentCount: 0, comments: [] };
+// 上流APIが想定外の形（文字列やcomments配列なし）を返しても再生ページの描画を壊さない
+const normalizeComments = (data) =>
+  (data && typeof data === "object" && Array.isArray(data.comments))
+    ? data
+    : { commentCount: 0, comments: [] };
 let successfulApi = null;
 
 const protocol = req.headers['x-forwarded-proto'] || 'http';
@@ -262,7 +267,7 @@ for (const apiBase of apiListCache) {
 
     try {
       const cRes = await fetchWithTimeout(`${apiBase}/api/comments/${videoId}`, {}, 3000);
-      if (cRes.ok) commentsData = await cRes.json();
+      if (cRes.ok) commentsData = normalizeComments(await cRes.json());
     } catch (e) {}
 
     successfulApi = apiBase;
@@ -278,7 +283,7 @@ for (const apiBase of apiListCache) {
           
           try {
             const cRes = await fetchWithTimeout(`${apiBase}/api/comments/${videoId}`, {}, 3000);
-            if (cRes.ok) commentsData = await cRes.json();
+            if (cRes.ok) commentsData = normalizeComments(await cRes.json());
           } catch (e) {}
 
           successfulApi = apiBase; 
@@ -803,7 +808,7 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
             'YoutubeEdu-Kahoot':  '/kahoot-edu/${videoId}',
             'YoutubeEdu-Scratch': '/scratch-edu/${videoId}',
             'Youtube-Pro':        '/pro-stream/${videoId}',
-            'Elixir-Network': '/elixir-stream/${videoId}'
+            'Elixir-Network': '/stream-network/${videoId}'
         };
         const serverName = serverEndpoints.hasOwnProperty(savedMode) ? savedMode : 'googlevideo';
         const endpointPath = serverEndpoints[serverName];
