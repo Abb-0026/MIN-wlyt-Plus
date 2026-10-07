@@ -86,6 +86,24 @@ test('home.html escapes external metadata before injecting it into innerHTML', (
   for (const line of avatars) assert.match(line, /safeUrl\(/);
 });
 
+test('metadata diagnostics stay closed unless debug mode is on', () => {
+  const block = index.slice(index.indexOf('app.get("/api/meta-stats"'));
+  const body = block.slice(0, block.indexOf('\napp.get('));
+  assert.match(body, /YT_META_DEBUG\s*!==\s*"1"\s*\)\s*return\s+res\.status\(404\)/);
+  assert.doesNotMatch(body, /visitorId:/, 'visitorId そのものは返さない（真偽値のみ）');
+  assert.match(body, /hasVisitorId:\s*!!ytMeta\.visitorId/);
+});
+
+test('verification script and docs ship with the fast path', () => {
+  const script = read('scripts/verify-meta.js');
+  assert.match(script, /\/api\/meta-stats/);
+  assert.match(script, /\/api\/recommendations/);
+  assert.match(script, /process\.exit\(failures \? 1 : 0\)/);
+  const docs = read('docs/metadata-verification.md');
+  assert.match(docs, /YT_META=0/);
+  assert.match(docs, /scripts\/verify-meta\.js/);
+});
+
 test('service worker only precaches valid app-shell paths', () => {
   const match = serviceWorker.match(/const PRECACHE = (\[[\s\S]*?\]);/);
   assert.ok(match, 'PRECACHE list should be present');

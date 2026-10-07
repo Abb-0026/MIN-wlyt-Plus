@@ -101,7 +101,17 @@ node index.js
 すべて**追加**であり、置き換えではありません。高速経路が失敗・0件のときは従来の取得処理へフォールバックします。
 
 - 無効化: 環境変数 `YT_META=0`
-- デバッグログ: `YT_META_DEBUG=1`
+- デバッグログ: `YT_META_DEBUG=1`（`[yt-meta]` ログと `/api/meta-stats` が有効になる）
+
+**実機検証は必須です**（開発環境から YouTube へ到達できないため、単体テストはモック応答に対するものです）:
+
+```bash
+node scripts/verify-meta.js https://your-app.example.com
+# 動画IDを指定する場合
+node scripts/verify-meta.js https://your-app.example.com --video=dQw4w9WgXcQ
+```
+
+ログの読み方・症状別の対処・パーサ追従の直し方は [`docs/metadata-verification.md`](docs/metadata-verification.md) にまとめています。
 
 ### Service Worker / キャッシュの方針
 

@@ -54,6 +54,19 @@ app.get("/healthz", (_req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
+// メタデータ高速経路の診断用。実機検証のときだけ YT_META_DEBUG=1 で有効にする。
+// 既定では 404（外部にキャッシュの中身や visitorId を見せない）。
+app.get("/api/meta-stats", (_req, res) => {
+  if (process.env.YT_META_DEBUG !== "1") return res.status(404).json({ error: "not found" });
+  res.json({
+    enabled: YT_META_ENABLED,
+    hasVisitorId: !!ytMeta.visitorId,
+    cacheSize: ytMeta.cache.size,
+    stats: ytMeta.stats,
+    now: Date.now(),
+  });
+});
+
 let apiListCache = [];
 
 async function updateApiListCache() {
@@ -1183,7 +1196,8 @@ app.get("/api/comments/:videoId", async (req, res) => {
       }
     } catch (e) { continue; }
   }
-  res.status(500).json({ error: "コメントの取得に失敗しました" });
+  // 取得元が全滅しても 500 にしない（UI は「0件」として扱える）
+  res.json({ commentCount: 0, comments: [], continuation: null });
 });
 
 // --- 修正: 既存の /api/channel (ページングをより確実に) ---
