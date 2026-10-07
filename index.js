@@ -8,7 +8,8 @@ const https = require("https");
 const fs = require('fs');
 const { StreamResolver, normalizeComments } = require("./lib/stream-resolver");
 const { YtMetadata } = require("./lib/yt-innertube");
-const { createProxiedFetch, proxiesFromEnv } = require("./lib/proxy-tunnel");
+const { createProxiedFetch, proxiesFromEnv, parseProxyList } = require("./lib/proxy-tunnel");
+const { ProxyHarvester } = require("./lib/proxy-sources");
 
 let wispServer = null;
 try {
@@ -66,6 +67,7 @@ app.get("/api/meta-stats", (_req, res) => {
     stats: ytMeta.stats,
     meta: ytMeta.state(),     // サーキットブレーカー / ネガティブキャッシュの状態
     proxy: ytFetch.status(),  // プロキシの利用状況（認証情報は含めない）
+    proxySources: proxyHarvester ? proxyHarvester.status() : { enabled: false, reason: 'YT_META_PROXY が手動設定されている' },
     now: Date.now(),
   });
 });
@@ -105,13 +107,18 @@ const streamResolver = new StreamResolver({ fetchImpl: fetch, timeout: 4000, dea
 // --- メタデータ解決（InnerTube 直結の高速経路。失敗時は従来の yts 経路へフォールバック） ---
 // YT_META=0 で無効化できる。ストリームはここを通らない（player エンドポイントは叩かない）。
 //
-// IP ブロックされうる環境では、プロキシ経由で叩ける:
-//   YT_META_PROXY=http://user:pass@host:port          （複数はカンマ区切りでローテーション）
-//   YT_META_PROXY=socks5://user:pass@host:port
-// 未設定なら HTTPS_PROXY / HTTP_PROXY を見る。どちらも無ければ直接接続。
-// youtube-search-api（axios）は HTTPS_PROXY を自動で読むので、環境変数1つで両方カバーできる。
+// IP ブロックされうる環境では、プロキシ経由で叩ける。優先順位:
+//   1. YT_META_PROXY=http://user:pass@host:port  … 手動指定（カンマ区切りで複数、socks5:// も可）
+//   2. 無料プロキシリストの自動取得            … 既定で有効（YT_META_PROXY_AUTO=0 で止める）
+//   3. HTTPS_PROXY / HTTP_PROXY                 … 自動取得を止めたときのフォールバック
+// どれも無ければ直接接続。
+//
+// 自動取得は「裏でリストを取りに行き、取れた分から使う」ので起動をブロックしない。
+// 1回も取れなければ直接接続のまま（＝今までどおり）なので、壊れても従来経路で動く。
 const YT_META_ENABLED = process.env.YT_META !== "0";
-const ytProxies = proxiesFromEnv(process.env);
+const manualProxies = process.env.YT_META_PROXY ? parseProxyList(process.env.YT_META_PROXY) : [];
+const autoProxy = !manualProxies.length && process.env.YT_META_PROXY_AUTO !== "0";
+const ytProxies = manualProxies.length ? manualProxies : (autoProxy ? [] : proxiesFromEnv(process.env));
 const ytFetch = createProxiedFetch({
   proxies: ytProxies,
   fetchImpl: fetch,
@@ -129,9 +136,25 @@ const ytMeta = new YtMetadata({
   },
 });
 
+// 無料プロキシリストの自動取得（YT_META_PROXY を手で設定したときは動かない）
+const proxyHarvester = autoProxy
+  ? new ProxyHarvester({
+    pool: ytFetch.pool,
+    fetchImpl: fetch,
+    sources: process.env.YT_META_PROXY_SOURCES,
+    // ローカルのモック検証用（127.0.0.1 のプロキシを許可する）。本番では使わない。
+    allowPrivate: process.env.YT_META_PROXY_ALLOW_PRIVATE === "1",
+    logger: (msg, extra) => {
+      if (process.env.YT_META_DEBUG === "1") console.log(msg, extra || "");
+    },
+  })
+  : null;
+
 if (YT_META_ENABLED) {
+  proxyHarvester?.start(); // 裏でリストを取りに行く（起動は待たない）
   ytMeta.warmup(); // 起動時に裏で visitorData とトレンドを温める（初回の1往復を隠す）
-  setInterval(() => ytMeta.sweep(), 300000);
+  const sweepTimer = setInterval(() => ytMeta.sweep(), 300000);
+  if (typeof sweepTimer.unref === 'function') sweepTimer.unref();
 }
 
 /** 表示順を毎回シャッフルする（Fisher-Yates） */

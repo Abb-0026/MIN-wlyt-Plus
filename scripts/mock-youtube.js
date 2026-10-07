@@ -47,11 +47,35 @@ const { startMockStack } = require('../test-utils/mock-proxy');
     }
   }
 
+  // 「無料プロキシのリスト配信元」も用意する（自動取得の検証用）
+  const http = require('http');
+  const listServer = http.createServer((req, res) => {
+    if (req.url === '/empty.txt') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('\n');
+      return;
+    }
+    // 実物のリストは「死んだプロキシが大半」なので、到達不能なダミーも混ぜる
+    const entries = [
+      '# 自動取得の検証用リスト',
+      '203.0.113.1:8080',                                   // TEST-NET-3（到達不能）
+      stack.goodProxyUrl.replace('http://', ''),            // 通るプロキシ
+      '198.51.100.2:3128',                                  // TEST-NET-2（到達不能）
+      stack.blockedProxyUrl.replace('http://', ''),         // 403を返すプロキシ
+    ].join('\n');
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(entries);
+  });
+  await new Promise((resolve) => listServer.listen(0, '127.0.0.1', resolve));
+  const listPort = listServer.address().port;
+
   const lines = [
     ['偽YouTube (https)', stack.originUrl],
     ['CONNECT プロキシ（通す）', stack.goodProxyUrl],
     ['CONNECT プロキシ（403で拒否＝ブロック済みIPの想定）', stack.blockedProxyUrl],
     ['SOCKS5 プロキシ', socksAuth ? stack.socksUrl : stack.socksUrl + '  (認証なし)'],
+    ['プロキシリスト配信（自動取得用）', `http://127.0.0.1:${listPort}/proxies.txt`],
+    ['↑ 空リスト（取得元が死んだ想定）', `http://127.0.0.1:${listPort}/empty.txt`],
   ];
   console.log('\nモック環境を起動しました\n' + '─'.repeat(64));
   for (const [label, url] of lines) console.log(`  ${label}\n    ${url}`);
@@ -73,10 +97,20 @@ const { startMockStack } = require('../test-utils/mock-proxy');
   # → /api/meta-stats の meta.circuitOpen が true になり、
   #   stats.shortCircuited が増えても「外向き通信」は増えない
 
+  # 3) プロキシを手で設定せず、リストから自動取得する（本番の既定動作）
+  YT_META_PROXY_SOURCES=http://127.0.0.1:${listPort}/proxies.txt \
+  YT_META_PROXY_ALLOW_PRIVATE=1 YT_META_DEBUG=1 \
+  PORT=3000 node index.js
+  # （YT_META_HOST / YT_META_TLS_REJECT は 1) と同じ）
+  # → /api/meta-stats の proxySources.lastAdded が 4 になり、
+  #   死んだ2本＋403の1本を避けて、通るプロキシに当たるまで自動で回る
+
 Ctrl+C で終了します。
 `);
 
   const shutdown = async () => {
+    listServer.closeAllConnections();
+    listServer.close();
     await stack.close();
     process.exit(0);
   };

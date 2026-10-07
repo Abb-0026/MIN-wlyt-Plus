@@ -410,3 +410,59 @@ test('不正な videoId は往復せずに弾く', async () => {
   await assert.rejects(() => yt.videoMeta("'; DROP TABLE"), /invalid videoId/);
   assert.strictEqual(fetchImpl.calls.length, 0);
 });
+
+test('429（YouTube本体の拒否）とプロキシ不通は別に数える', async () => {
+  // 無料プロキシは不通が当たり前。不通だけで回路を開くと
+  // 「生きているプロキシを試す前に諦める」ことになるので、分けて数える。
+  const mk = (status, failMessage) => {
+    const fetchImpl = async () => {
+      if (status) return { ok: false, status, json: async () => ({}) };
+      throw new Error(failMessage);
+    };
+    return new YtMetadata({ fetchImpl, hedgeMs: 0, circuitThreshold: 3, transportThreshold: 6 });
+  };
+
+  // 429 → IPブロックの兆候 → 3回で回路が開く
+  const rejected = mk(429, null);
+  for (let i = 0; i < 3; i++) await rejected.search(`q${i}`).catch(() => {});
+  assert.strictEqual(rejected.state().consecutiveFailures, 3);
+  assert.ok(rejected.state().circuitOpen, '429 は即座に回路を開く');
+
+  // 不通 → プロキシを替えれば直るはず → すぐには開かない
+  const unreachable = mk(0, 'connect ECONNREFUSED 127.0.0.1:1');
+  for (let i = 0; i < 3; i++) await unreachable.search(`q${i}`).catch(() => {});
+  assert.strictEqual(unreachable.state().circuitOpen, false, '不通だけでは回路を開かない');
+  assert.strictEqual(unreachable.state().transportFailures, 3);
+  assert.strictEqual(unreachable.state().consecutiveFailures, 0, '拒否としては数えない');
+
+  // とはいえ延々と失敗し続けたら止まる（transportThreshold）
+  for (let i = 0; i < 5; i++) await unreachable.search(`more${i}`).catch(() => {});
+  assert.ok(unreachable.state().circuitOpen, '不通が続けば最終的には止まる');
+});
+
+test('プロキシ不通は即リトライの余地を残す（ネガティブキャッシュしない）', async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls++;
+    throw new Error('proxy connect timeout');
+  };
+  const yt = new YtMetadata({ fetchImpl, hedgeMs: 0, transportThreshold: 99 });
+  await yt.search('same').catch(() => {});
+  await yt.search('same').catch(() => {});
+  // 同じクエリでも即座に次のプロキシで試す（ローテーションの余地を残す）
+  assert.strictEqual(calls, 2);
+
+  // 429 のときは覚えて、すぐには再挑戦しない
+  let rejected = 0;
+  const blocked = new YtMetadata({
+    fetchImpl: async () => {
+      rejected++;
+      return { ok: false, status: 429, json: async () => ({}) };
+    },
+    hedgeMs: 0,
+    circuitThreshold: 99,
+  });
+  await blocked.search('same').catch(() => {});
+  await blocked.search('same').catch(() => {});
+  assert.strictEqual(rejected, 1, '拒否されたリクエストは一定時間再挑戦しない');
+});

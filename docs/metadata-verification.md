@@ -20,7 +20,10 @@ YT_META_DEBUG=1
 | --- | --- | --- |
 | `YT_META` | `1` | `0` で高速経路を完全に無効化（従来経路のみ） |
 | `YT_META_DEBUG` | 未設定 | `1` で `[yt-meta]` ログと `/api/meta-stats` を有効化 |
-| `YT_META_PROXY` | 未設定 | プロキシ（カンマ区切りで複数 → ローテーション）。`http://` `https://` `socks5://` 可。**未設定なら `HTTPS_PROXY` → `HTTP_PROXY` を見る** |
+| `YT_META_PROXY` | 未設定 | プロキシを**手動**指定（カンマ区切りで複数 → ローテーション）。`http://` `https://` `socks5://` 可 |
+| `YT_META_PROXY_AUTO` | `1` | `0` で無料プロキシリストの**自動取得を止める**（手動指定があるときは自動で動きません） |
+| `YT_META_PROXY_SOURCES` | 既定の公開リスト10件 | リストの取得元（カンマ区切り）。自前のリスト配信に差し替えられる |
+| `YT_META_PROXY_ALLOW_PRIVATE` | `0` | `1` で 127.0.0.1 / 私有IP のプロキシも使う（**ローカル検証専用**） |
 | `YT_META_HOST` | `https://www.youtube.com` | 接続先（ローカルのモック検証用。本番では触らない） |
 | `YT_META_TLS_REJECT` | `1` | `0` で証明書検証を無効化（**ローカル検証用。本番では絶対に使わない**） |
 
@@ -46,6 +49,42 @@ HTTPS_PROXY=http://user:pass@proxy.example.com:8080
 TLS はプロキシを**貫通**します（CONNECT トンネルの上で end-to-end に TLS）。
 プロキシ事業者には暗号化されたストリームしか見えません。
 実装は `lib/proxy-tunnel.js`（undici / https-proxy-agent などの依存は追加していません）。
+
+### プロキシを設定しない場合（既定）
+
+`YT_META_PROXY` を設定しなければ、**無料プロキシのリストを自動取得して使います**（`lib/proxy-sources.js`）。
+
+- 起動時に裏でリストを取りに行きます（**起動はブロックしません**。取れる前のリクエストは従来経路へ）
+- 以後 15 分ごと、または「使えるプロキシが尽きかけた」ときに取り直します
+- 取得元は**既定で10件**。1つ死んでも他が生きていれば成立します。**全部失敗したら前回のリストを捨てません**
+- 取り込むのは最大 300 本。プライベート/ループバックは除外します
+- **事前の生死確認はしません**。数百本すべてに CONNECT を打つほうが重いので、実際に使って失敗したものから冷却して外します
+
+```
+[yt-proxy] refresh: 4 proxies from 1/1 sources { total: 4, ms: 31, kept: false }
+```
+
+⚠ **無料プロキシは第三者が運用しています。** TLS は end-to-end なので中身は見えませんが、
+接続先ホスト名（`www.youtube.com`）は見えます。証明書検証は既定で有効（`YT_META_TLS_REJECT` は触らない）なので、MITM は失敗します。
+信頼できない経路を使いたくなければ `YT_META_PROXY_AUTO=0` で止めて、自分のプロキシを `YT_META_PROXY` に設定してください。
+
+既定の取得元（到達可否は環境によります。`YT_META_PROXY_SOURCES` で丸ごと差し替えられます）:
+
+```
+https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt
+https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt
+https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt
+https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt
+https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt
+https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt
+https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all
+https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all
+https://www.proxy-list.download/api/v1/get?type=http
+https://spys.me/proxy.txt
+```
+
+> これらの URL は開発環境から到達できないため、**実際に取得できるかは本番で確認してください**。
+> `/api/meta-stats` の `proxySources.sources[]` に、取得元ごとの `ok` / `count` / `ms` / `error` が出ます。
 
 ---
 
@@ -141,6 +180,18 @@ node scripts/verify-meta.js https://your-app.example.com --video=dQw4w9WgXcQ
 | `meta.hedging` | 失敗中は `false`。予備クライアントを並走させず往復を 1/3 にする |
 | `meta.negativeEntries` | 「このリクエストは直近失敗した」と覚えている数（30秒で再挑戦） |
 | `proxy.proxies[].coolingFor` | そのプロキシを次に使うまでの残り待ち時間（失敗ごとに倍増、最大10分） |
+| `proxySources.lastAdded` | 最後の自動取得で取り込んだ本数 |
+| `proxySources.sources[]` | 取得元ごとの成否（`ok` / `count` / `ms` / `error`） |
+
+**失敗は2種類に分けて数えます**（ここが要点）:
+
+| 種類 | 例 | 扱い |
+| --- | --- | --- |
+| **拒否**（systemic） | YouTube 本体が **HTTP 429 / 403** を返した | IPブロックの兆候。3回で回路を開き、30秒そのリクエストを覚える |
+| **不通**（transport） | プロキシが CONNECT を拒否、タイムアウト、接続不能 | **プロキシが悪いだけ**。12回までは即座に別のプロキシで再挑戦する |
+
+「プロキシが 403 を返した」文字列は両方に現れるので、**実際に origin から返った HTTP ステータス**だけで判定しています
+（`proxy refused CONNECT: HTTP 403` は誤判定しません）。
 
 動き:
 
@@ -195,8 +246,12 @@ node scripts/verify-meta.js http://127.0.0.1:3000
 
 | シナリオ | 外向き CONNECT | `/api/search` 応答 |
 | --- | --- | --- |
-| プロキシが通る | リクエストごとに 1〜3（ヘッジ） | 初回 13ms / 2回目 3ms（キャッシュ） |
-| プロキシが 403（ブロック済み） | **最初の 5 回で打ち止め**、以降は 0 | 10ms 前後（＝待ち時間なしでフォールバック） |
+| 手動でプロキシ指定（通る） | リクエストごとに 1〜3（ヘッジ） | 初回 13ms / 2回目 3ms（キャッシュ） |
+| 手動でプロキシ指定（403＝ブロック済み） | **最初の 5 回で打ち止め**、以降は 0 | 10ms 前後（＝待ち時間なしでフォールバック） |
+| **リスト自動取得**（4本中3本が死んでいる） | 死んだ3本は1回ずつ試して冷却、以降は生きている1本だけ | 1回目 447ms（死んだプロキシに当たる→従来経路）→ **2回目 12ms で items=1** |
+
+自動取得は「最初の数回は外れを引く」前提で、**外れたプロキシを即座に冷却して次へ回す**ので、
+数リクエストで自然に生きているプロキシに落ち着きます。
 
 ## 7. 撤退手順（安全第一）
 

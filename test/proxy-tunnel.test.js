@@ -145,9 +145,10 @@ test('死んだプロキシは避けて生きている方へ回る', async () =>
     const status = pool.status();
     const blockedEntry = status.proxies.find((p) => p.proxy === blockedLabel);
     const goodEntry = status.proxies.find((p) => p.proxy === goodLabel);
-    assert.ok(blockedEntry.failures >= 2, `ブロック側が失敗している: ${JSON.stringify(status)}`);
-    assert.ok(blockedEntry.coolingFor > 0, 'ブロック側が冷却に入る');
-    assert.ok(goodEntry.ok >= 2, '生きている側は成功している');
+    assert.ok(blockedEntry.failures >= 1, `ブロック側が失敗している: ${JSON.stringify(status)}`);
+    assert.ok(blockedEntry.coolingFor > 0, '1回失敗したら即冷却に入る');
+    assert.ok(goodEntry.ok >= 4, `生きている側に寄る: ${JSON.stringify(status)}`);
+    assert.ok(goodEntry.ok > blockedEntry.ok, '生きている方が多く使われる');
 
     // 以降は健全な方だけが選ばれる
     const used = new Set();
@@ -198,7 +199,8 @@ test('ブロックされた環境では外向き通信を止める（サーキ�
       host: stack.originUrl,
       timeout: 2000,
       hedgeMs: 0,
-      circuitThreshold: 2,
+      transportThreshold: 2,   // プロキシ不通が続いたら止める
+      circuitThreshold: 99,
       circuitCooldown: 60000,
       negativeTtl: 30000,
     });
@@ -227,37 +229,28 @@ test('ブロックされた環境では外向き通信を止める（サーキ�
   });
 });
 
-test('同一リクエストの連続失敗はネガティブキャッシュで即座に諦める', async () => {
-  await withStack(async (stack) => {
-    let outbound = 0;
-    const countingFetch = (url, init) => {
-      outbound++;
-      return nodeFetch(url, init);
-    };
-    const blockedFetch = createProxiedFetch({
-      proxies: stack.blockedProxyUrl,
-      fetchImpl: countingFetch,
-      rejectUnauthorized: REJECT_UNAUTHORIZED,
-      tunnelTimeout: 2000,
-    });
-    const yt = new YtMetadata({
-      fetchImpl: blockedFetch,
-      host: stack.originUrl,
-      timeout: 2000,
-      hedgeMs: 0,
-      circuitThreshold: 99, // 回路は開かせず、ネガティブキャッシュだけを見る
-      negativeTtl: 30000,
-    });
-
-    await assert.rejects(() => yt.search('same query'));
-    const after1 = outbound;
-    await assert.rejects(() => yt.search('same query'), /negative-cached/);
-    assert.strictEqual(outbound, after1, '同じクエリは往復せずに即失敗する');
-
-    // 別のクエリは普通に叩く
-    await assert.rejects(() => yt.search('other query'), /failed/);
-    assert.ok(outbound > after1);
+test('YouTube本体に拒否されたリクエストはしばらく再挑戦しない', async () => {
+  // 429/403 は「IPが弾かれている」＝すぐ再挑戦しても無駄なので、30秒覚える。
+  // ただしプロキシ不通は別（次々プロキシを替えれば当たるかもしれないので覚えない）。
+  let rejected = 0;
+  const fetchImpl = async () => {
+    rejected++;
+    return { ok: false, status: 429, json: async () => ({}) };
+  };
+  const yt = new YtMetadata({
+    fetchImpl,
+    hedgeMs: 0,
+    circuitThreshold: 99, // 回路は開かせず、ネガティブキャッシュだけを見る
+    negativeTtl: 30000,
   });
+
+  await assert.rejects(() => yt.search('same query'), /failed/);
+  await assert.rejects(() => yt.search('same query'), /negative-cached/);
+  assert.strictEqual(rejected, 1, '同じリクエストは往復せずに即失敗する');
+
+  // 別のクエリは普通に叩く
+  await assert.rejects(() => yt.search('other query'), /failed/);
+  assert.strictEqual(rejected, 2);
 });
 
 test('成功が1回あれば回路は閉じて予備クライアント並走も戻る', async () => {
@@ -275,5 +268,45 @@ test('成功が1回あれば回路は閉じて予備クライアント並走も�
     assert.strictEqual(state.consecutiveFailures, 0);
     assert.strictEqual(state.circuitOpen, false);
     assert.strictEqual(state.hedging, true);
+  });
+});
+
+test('プロキシの CONNECT 拒否(403)は「YouTubeに拒否された」と誤判定しない', async () => {
+  await withStack(async (stack) => {
+    const yt = new YtMetadata({
+      fetchImpl: metaFetch(stack.blockedProxyUrl),
+      host: stack.originUrl,
+      timeout: 2000,
+      hedgeMs: 0,
+      circuitThreshold: 2,
+    });
+    for (let i = 0; i < 3; i++) await yt.search(`q${i}`).catch(() => {});
+    const st = yt.state();
+    // 「proxy refused CONNECT: HTTP 403」は origin からの 403 ではない
+    assert.strictEqual(st.consecutiveFailures, 0, '拒否として数えない');
+    assert.ok(st.transportFailures >= 3, `プロキシ不通として数える: ${JSON.stringify(st)}`);
+    assert.strictEqual(st.circuitOpen, false, 'プロキシ不通で回路は開かない');
+  });
+});
+
+test('YouTube 本体の 429/403 は拒否として数えて即座に回路を開く', async () => {
+  await withStack(async (stack) => {
+    let calls = 0;
+    const fetchImpl = createProxiedFetch({
+      proxies: stack.goodProxyUrl,
+      fetchImpl: (url, init) => {
+        calls++;
+        return Promise.resolve({ ok: false, status: 429, json: async () => ({}) });
+      },
+      rejectUnauthorized: REJECT_UNAUTHORIZED,
+      tunnelTimeout: 3000,
+    });
+    const yt = new YtMetadata({ fetchImpl, host: stack.originUrl, timeout: 2000, hedgeMs: 0, circuitThreshold: 2 });
+    await yt.search('a').catch(() => {});
+    await yt.search('b').catch(() => {});
+    const st = yt.state();
+    assert.strictEqual(st.consecutiveFailures, 2);
+    assert.ok(st.circuitOpen, '本体の 429 は即座に回路を開く');
+    assert.ok(calls > 0);
   });
 });

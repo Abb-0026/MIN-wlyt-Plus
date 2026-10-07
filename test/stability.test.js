@@ -104,6 +104,24 @@ test('verification script and docs ship with the fast path', () => {
   assert.match(docs, /scripts\/verify-meta\.js/);
 });
 
+test('proxy handling stays opt-out and keeps the manual override', () => {
+  const block = index.slice(index.indexOf('const YT_META_ENABLED'));
+  const body = block.slice(0, block.indexOf('// --- ストリーム解決'));
+  assert.match(body, /YT_META_PROXY/);
+  assert.match(body, /YT_META_PROXY_AUTO/, '自動取得の停止スイッチがある');
+  assert.match(body, /ProxyHarvester/, '自動取得が配線されている');
+  assert.match(body, /manualProxies\.length \? manualProxies/, '手動指定が最優先');
+  // 自動取得は既定の公開リストを持ち、起動をブロックしない
+  const sources = read('lib/proxy-sources.js');
+  assert.match(sources, /DEFAULT_SOURCES\s*=/);
+  assert.match(sources, /start\(\)[\s\S]{0,400}this\.refresh\(\)\.catch/);
+  const tunnel = read('lib/proxy-tunnel.js');
+  // 依存を増やさない（コメントで言及しているだけなので require の形で見る）
+  assert.doesNotMatch(tunnel, /require\(['"]undici['"]\)/);
+  assert.doesNotMatch(tunnel, /require\(['"]https-proxy-agent['"]\)/);
+  assert.doesNotMatch(tunnel, /require\(['"]socks-proxy-agent['"]\)/);
+});
+
 test('service worker only precaches valid app-shell paths', () => {
   const match = serviceWorker.match(/const PRECACHE = (\[[\s\S]*?\]);/);
   assert.ok(match, 'PRECACHE list should be present');
