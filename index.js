@@ -6,6 +6,7 @@ const fetch = require("node-fetch");
 const cookieParser = require("cookie-parser");
 const https = require("https");
 const fs = require('fs');
+const { StreamResolver, normalizeComments } = require("./lib/stream-resolver");
 
 let wispServer = null;
 try {
@@ -21,8 +22,10 @@ const port = process.env.PORT || 3000;
 app.set("views", path.join(__dirname, "views"));
 app.set("view engine", "ejs");
 
-const API_HEALTH_CHECKER = "https://raw.githubusercontent.com/Minotaur-ZAOU/test/refs/heads/main/min-tube-api.json";
-const TEMP_API_LIST = "https://raw.githubusercontent.com/Minotaur-ZAOU/test/refs/heads/main/min-tube-api.json";
+// 上流（Min-Tube API）の一覧URL。セルフホスト時やテスト時は MIN_TUBE_API_LIST で差し替えられる。
+const API_HEALTH_CHECKER = process.env.MIN_TUBE_API_LIST
+  || "https://raw.githubusercontent.com/Minotaur-ZAOU/test/refs/heads/main/min-tube-api.json";
+const TEMP_API_LIST = API_HEALTH_CHECKER;
 const RAPID_API_HOST = 'ytstream-download-youtube-videos.p.rapidapi.com';
 const videoCache = new Map();
 const userAgents = [
@@ -79,6 +82,21 @@ function fetchWithTimeout(url, options = {}, timeout = 5000) {
   ]);
 }
 
+// --- ストリーム解決（全取得元を並列レース + メモリキャッシュ） ---
+const streamResolver = new StreamResolver({ fetchImpl: fetch, timeout: 4000, deadline: 6000 });
+
+// 動的レスポンス（HTML/JSON）は Service Worker にもブラウザにもキャッシュさせない。
+// キャッシュされると「動画ページに遷移できない / 古いストリームURLで再生できない」不具合になる。
+// ただしプロキシのフロントエンドは静的アセットなので、従来どおりキャッシュさせる。
+const STATIC_PREFIX = /^\/(?:proxy|uv|prxy)(?:\/|$)/;
+app.use((req, res, next) => {
+  if (!STATIC_PREFIX.test(req.path)) {
+    res.setHeader('Cache-Control', 'no-store, must-revalidate');
+    res.setHeader('Vary', 'Cookie');
+  }
+  next();
+});
+
 setInterval(() => {
     const now = Date.now();
     for (const [videoId, cachedItem] of videoCache.entries()) {
@@ -86,11 +104,13 @@ setInterval(() => {
             videoCache.delete(videoId);
         }
     }
+    streamResolver.sweep();
 }, 300000);
 
-// ミドルウェア: 人間確認,
+// ミドルウェア: 人間確認
+// /video/* と /api/* は対象外。ここをガードすると動画ページ遷移が認証画面で詰むため。
 app.use(async (req, res, next) => {
-  if (req.path.startsWith("/api") || req.path.startsWith("/video") || req.path === "/") {
+  if (req.path === "/") {
     if (!req.cookies || req.cookies.humanVerified !== "true") {
       const pages = [
         'https://raw.githubusercontent.com/woolisbest-honke/min-wlyt-plus/refs/heads/main/assist/memo/min-tube-pro-main-loading.txt',
@@ -229,78 +249,145 @@ app.get("/api/recommendations", async (req, res) => {
   }
 });
 
+const escapeAttr = (value) =>
+  String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+const escapeHtml = (value) =>
+  String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+// HTML 中の <script> に文字列を埋め込むためのヘルパー。
+// JSON.stringify だけでは < が残り、</script> でタグが壊れてしまう。
+const jsString = (value) =>
+  JSON.stringify(value == null ? "" : String(value))
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+
+const videoHtml = (url, videoId) =>
+  `<video id="mainPlayer" controls autoplay playsinline preload="auto" poster="https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg" style="width:100%; height:100%; position:relative; z-index:10; background:#000;"><source src="${escapeAttr(url)}" type="video/mp4"></video>`;
+
+const iframeHtml = (url) =>
+  `<iframe id="mainIframe" src="${escapeAttr(url)}" frameborder="0" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen style="width:100%; height:100%; position:relative; z-index:10;"></iframe>`;
+
+const isEmbedUrl = (url) => typeof url === "string" && url.includes("embed");
+
+/**
+ * 動画サーバー（再生モード）ごとの URL を引く。
+ * 取得できなかった場合は null を返し、呼び出し側で googlevideo にフォールバックする。
+ */
+async function resolveModeUrl(mode, videoId, baseUrl) {
+  switch (mode) {
+    case "DL-Pro":
+      try {
+        return { url: await streamResolver.getLateUrl(videoId), type: "video" };
+      } catch (e) {
+        return null;
+      }
+    case "YoutubeEdu-Kahoot":
+      try {
+        const res = await fetchWithTimeout("https://raw.githubusercontent.com/wista-api-project/auto/refs/heads/main/edu/3.txt", {}, 2500);
+        if (!res.ok) return null;
+        const params = (await res.text()).trim();
+        return { url: `https://www.youtubeeducation.com/embed/${videoId}${params}`, type: "iframe" };
+      } catch (e) {
+        return null;
+      }
+    case "YoutubeEdu-Scratch":
+      try {
+        const res = await fetchWithTimeout("https://raw.githubusercontent.com/wista-api-project/auto/refs/heads/main/edu/2.txt", {}, 2500);
+        if (!res.ok) return null;
+        const config = await res.json();
+        return { url: `https://www.youtubeeducation.com/embed/${videoId}${config.params}`, type: "iframe" };
+      } catch (e) {
+        return null;
+      }
+    case "youtube-nocookie":
+      return { url: `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1`, type: "iframe" };
+    case "Youtube-Pro":
+      return { url: `${baseUrl}/pro-stream/${videoId}`, type: "iframe" };
+    case "Elixir-Network":
+      return { url: `${baseUrl}/proxy/embed.html#https://www.youtube-nocookie.com/embed/${videoId}`, type: "iframe" };
+    default:
+      return null;
+  }
+}
+
+/**
+ * プレイヤー HTML をサーバー側で組み立てる（旧・最速バージョンの復元）。
+ * クライアントの window.onload と追加 fetch を待たず、
+ * HTML の解析中にストリームのバッファリングが始まる。
+ */
+async function buildPlayerHtml({ videoId, videoData, baseUrl, mode }) {
+  const rawUrl = (videoData && videoData.stream_url) || "";
+  const fallbackUrl = !rawUrl || rawUrl === "youtube-nocookie"
+    ? `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1`
+    : rawUrl;
+
+  const renderFallback = () => ({
+    mode: "googlevideo",
+    html: isEmbedUrl(fallbackUrl) ? iframeHtml(fallbackUrl) : videoHtml(fallbackUrl, videoId),
+  });
+
+  if (!mode || mode === "googlevideo") return renderFallback();
+
+  const resolved = await resolveModeUrl(mode, videoId, baseUrl);
+  if (!resolved) return renderFallback();
+
+  return {
+    mode,
+    html: resolved.type === "iframe" ? iframeHtml(resolved.url) : videoHtml(resolved.url, videoId),
+  };
+}
+
 app.get("/video/:id", async (req, res, next) => {
 const videoId = req.params.id;
 try {
 let videoData = null;
 let commentsData = { commentCount: 0, comments: [] };
-// 上流APIが想定外の形（文字列やcomments配列なし）を返しても再生ページの描画を壊さない
-const normalizeComments = (data) =>
-  (data && typeof data === "object" && Array.isArray(data.comments))
-    ? data
-    : { commentCount: 0, comments: [] };
-let successfulApi = null;
 
 const protocol = req.headers['x-forwarded-proto'] || 'http';
 const host = req.headers.host;
+const baseUrl = `${protocol}://${host}`;
 
-for (const apiBase of apiListCache) {
-  try {
-    videoData = await Promise.any([
-      fetchWithTimeout(`${apiBase}/api/video/${videoId}`, {}, 5000)
-        .then(res => res.ok ? res.json() : Promise.reject())
-        .then(data => data.stream_url ? data : Promise.reject()),
-      fetchWithTimeout(`${protocol}://${host}/sia-dl/${videoId}`, {}, 5000)
-        .then(res => res.ok ? res.json() : Promise.reject())
-        .then(data => data.stream_url ? data : Promise.reject()),
+// --- ストリーム取得（高速化版） ---
+// 旧実装: Promise.any( api → sia-dl → ai-fetch(2秒待ち) ) のあと rapid を直列に試し、
+//         さらにコメント取得(最大3秒)を直列で待ってからHTMLを返していた。
+// 新実装: 全取得元を同時に走らせて最速の成功を採用、コメントは並列・打ち切り付き。
+const [resolved, comments] = await Promise.all([
+  streamResolver.resolve(videoId, { apiList: apiListCache, baseUrl }),
+  streamResolver.resolveComments(videoId, { apiList: apiListCache }),
+]);
 
-      new Promise((resolve, reject) => {
-        setTimeout(() => {
-          fetchWithTimeout(`${protocol}://${host}/ai-fetch/${videoId}`, {}, 5000)
-            .then(res => res.ok ? res.json() : Promise.reject())
-            .then(data => data.stream_url ? resolve(data) : reject())
-            .catch(reject);
-        }, 2000);
-      })
-    ]);
-
-
-    try {
-      const cRes = await fetchWithTimeout(`${apiBase}/api/comments/${videoId}`, {}, 3000);
-      if (cRes.ok) commentsData = normalizeComments(await cRes.json());
-    } catch (e) {}
-
-    successfulApi = apiBase;
-    break;
-
-  } catch (e) {
-    try {
-      const rapidRes = await fetchWithTimeout(`${protocol}://${host}/rapid/${videoId}`, {}, 5000);
-      if (rapidRes.ok) {
-        const rapidData = await rapidRes.json();
-        if (rapidData.stream_url) {
-          videoData = rapidData;
-          
-          try {
-            const cRes = await fetchWithTimeout(`${apiBase}/api/comments/${videoId}`, {}, 3000);
-            if (cRes.ok) commentsData = normalizeComments(await cRes.json());
-          } catch (e) {}
-
-          successfulApi = apiBase; 
-          break; 
-        }
-      }
-    } catch (rapidErr) {}
-    continue;
+if (resolved) {
+  videoData = resolved.data;
+  if (process.env.NODE_ENV !== 'test') {
+    console.log(`[stream] ${videoId} <- ${resolved.provider} (${resolved.ms}ms, cached=${resolved.cached})`);
   }
 }
+commentsData = normalizeComments(comments);
 
-if (!videoData) {
+if (!videoData || !videoData.stream_url) {
   videoData = { videoTitle: "再生できない動画", stream_url: "youtube-nocookie" };
 }
 
-console.log(commentsData)
-let isShortForm = videoData.videoTitle.includes('#');
+// 上流がタイトルを返さない場合でもページ描画を壊さない
+videoData.videoTitle = videoData.videoTitle || "";
+videoData.channelName = videoData.channelName || "";
+
+// HTML/JS に埋め込む用。動画IDはURL由来なので必ずエンコードしてから使う。
+const safeId = encodeURIComponent(videoId);
+
+let isShortForm = String(videoData.videoTitle).includes('#');
 
 if (isShortForm) {
     try {
@@ -331,7 +418,7 @@ const shortsHtml = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>${videoData.videoTitle}</title>
+    <title>${escapeHtml(videoData.videoTitle)}</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; color: #fff; font-family: "Roboto", sans-serif; overflow: hidden; }
@@ -389,13 +476,13 @@ const shortsHtml = `
                 <div class="action-btn"><div class="btn-icon" style="background:none;"><img src="${videoData.channelImage || `https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=random&color=fff&size=64&bold=true`}" style="width:30px; height:30px; border-radius:4px; border:2px solid #fff;" onerror="this.src='https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=555&color=fff&size=64&bold=true'"></div></div>
             </div>
             <div class="bottom-overlay">
-                <div class="channel-info"><img src="${videoData.channelImage || `https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=random&color=fff&size=64&bold=true`}" onerror="this.src='https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=555&color=fff&size=64&bold=true'"><a href="/channel/${encodeURIComponent(videoData.channelName)}" style="text-decoration:none;color:inherit;"><span class="channel-name">@${videoData.channelName}</span></a><button id="shortSubBtn" class="subscribe-btn" onclick="toggleShortSub()">登録</button></div>
-                <div class="video-title">${videoData.videoTitle}</div>
+                <div class="channel-info"><img src="${videoData.channelImage || `https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=random&color=fff&size=64&bold=true`}" onerror="this.src='https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=555&color=fff&size=64&bold=true'"><a href="/channel/${encodeURIComponent(videoData.channelName)}" style="text-decoration:none;color:inherit;"><span class="channel-name">@${escapeHtml(videoData.channelName)}</span></a><button id="shortSubBtn" class="subscribe-btn" onclick="toggleShortSub()">登録</button></div>
+                <div class="video-title">${escapeHtml(videoData.videoTitle)}</div>
             </div>
             <div id="commentsPanel" class="comments-panel">
                 <div class="comments-header"><h3 style="margin:0; font-size:16px;">コメント</h3><i class="fas fa-times" style="cursor:pointer;" onclick="toggleComments()"></i></div>
                 <div class="comments-body">
-                    ${commentsData.comments.length > 0 ? commentsData.comments.map(c => `<div class="comment-item"><img class="comment-avatar" src="${c.authorThumbnails?.[0]?.url || 'https://via.placeholder.com/32'}"><div><div style="font-size:12px; color:#aaa; font-weight:bold;">${c.author}</div><div style="font-size:14px; margin-top:2px;">${c.content}</div></div></div>`).join('') : '<p style="text-align:center; color:#888;">コメントはありません</p>'}
+                    ${commentsData.comments.length > 0 ? commentsData.comments.map(c => `<div class="comment-item"><img class="comment-avatar" src="${escapeAttr(c.authorThumbnails?.[0]?.url || 'https://via.placeholder.com/32')}"><div><div style="font-size:12px; color:#aaa; font-weight:bold;">${escapeHtml(c.author)}</div><div style="font-size:14px; margin-top:2px;">${escapeHtml(c.content)}</div></div></div>`).join('') : '<p style="text-align:center; color:#888;">コメントはありません</p>'}
                 </div>
             </div>
         </div>
@@ -407,7 +494,8 @@ const shortsHtml = `
         const swipeHint = document.getElementById('swipeHint');
         const progressBar = document.getElementById('progressBar');
 
-        window.onload = async () => {
+        // window.onload ではなく DOMContentLoaded（画像完了を待たない分だけ早く再生が始まる）
+        document.addEventListener('DOMContentLoaded', async () => {
             // 設定から保存された再生方法を取得
             const savedMode = localStorage.getItem('playbackMode') || 'googlevideo';
 
@@ -475,11 +563,11 @@ const shortsHtml = `
             loader.classList.add('fade');
             swipeHint.classList.add('show');
             setTimeout(() => { swipeHint.classList.remove('show'); }, 300);
-        };
+        });
 
         function toggleComments() { commentsPanel.classList.toggle('open'); }
         // チャンネル登録機能（ショート）
-        const SHORT_CHANNEL = "${videoData.channelName || ''}";
+        const SHORT_CHANNEL = ${jsString(videoData.channelName || '')};
         const SHORT_SUB_KEY = 'subscribed_' + SHORT_CHANNEL;
         const shortSubBtn = document.getElementById('shortSubBtn');
         function updateShortSubBtn() {
@@ -499,7 +587,7 @@ const shortsHtml = `
             if (commentsPanel.classList.contains('open')) return;
             loader.classList.remove('fade');
             try {
-                const params = new URLSearchParams({ title: "${videoData.videoTitle}", channel: "${videoData.channelName}", id: "${videoId}" });
+                const params = new URLSearchParams({ title: ${jsString(videoData.videoTitle)}, channel: ${jsString(videoData.channelName)}, id: ${jsString(videoId)} });
                 const res = await fetch(\`/api/recommendations?\${params.toString()}\`);
                 const data = await res.json();
                 const nextShort = data.items.find(item => item.title.includes('#')) || data.items[0];
@@ -517,8 +605,11 @@ const shortsHtml = `
     }
 
     // --- STANDARD VIDEO MODE HTML ---
-    // playerWrapper は空にして、クライアント側JSが localStorage.playbackMode に基づいて初期化する
-const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#000;"><div class="spinner"></div></div>`;
+    // プレイヤーはサーバー側で直接書き込む（window.onload と追加fetchを待たない = 最速起動）
+const playbackMode = (req.cookies && req.cookies.playbackMode) || "googlevideo";
+const playerState = await buildPlayerHtml({ videoId, videoData, baseUrl, mode: playbackMode });
+const playerHtml = playerState.html;
+const renderedMode = playerState.mode;
 
     const html = `
 <!DOCTYPE html>
@@ -526,7 +617,7 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${videoData.videoTitle} - YouTube Pro</title>
+    <title>${escapeHtml(videoData.videoTitle)} - YouTube Pro</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         :root { --bg-main: #0f0f0f; --bg-secondary: #272727; --bg-hover: #3f3f3f; --text-main: #f1f1f1; --text-sub: #aaaaaa; --yt-red: #ff0000; }
@@ -610,19 +701,19 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
     <div class="main-content">
         <div class="player-container">
             <div id="playerWrapper" style="width:100%; height:100%;">
-                ${streamEmbedPlaceholder}
+                ${playerHtml}
             </div>
             <div id="videoLoadingOverlay" class="video-loading-overlay">
                 <div class="spinner"></div>
                 <div style="font-weight: bold; font-size: 16px;">動画サーバーに接続中...</div>
             </div>
         </div>
-        <h1 class="video-title">${videoData.videoTitle}</h1>
+        <h1 class="video-title">${escapeHtml(videoData.videoTitle)}</h1>
         <div class="owner-row">
             <div class="owner-info">
                 <a href="/channel/${encodeURIComponent(videoData.channelName)}" style="display:flex;align-items:center;gap:12px;text-decoration:none;color:inherit;">
                   <img id="ownerAvatar" src="${videoData.channelImage || `https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=random&color=fff&size=80&bold=true`}" style="width:40px;height:40px;border-radius:50%;object-fit:cover;" onerror="this.src='https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=555&color=fff&size=80&bold=true'">
-                  <div class="channel-name">${videoData.channelName}</div>
+                  <div class="channel-name">${escapeHtml(videoData.channelName)}</div>
                 </a>
                 <button id="subBtn" class="btn-sub" onclick="toggleSubscribeVideo()">チャンネル登録</button>
                 <div class="server-dropdown-container">
@@ -631,12 +722,12 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
                     </button>
                     <div id="serverMenu" class="server-menu">
                         <div class="server-option active" onclick="changeServer('googlevideo', '', event)">Googlevideo</div>
-                        <div class="server-option" onclick="changeServer('youtube-nocookie', '/nocookie/${videoId}', event)">Youtube-nocookie</div>
-                        <div class="server-option" onclick="changeServer('DL-Pro', '/360/${videoId}', event)">DL-Pro</div>
-                        <div class="server-option" onclick="changeServer('YoutubeEdu-Kahoot', '/kahoot-edu/${videoId}', event)">YoutubeEdu-Kahoot</div>
-                        <div class="server-option" onclick="changeServer('YoutubeEdu-Scratch', '/scratch-edu/${videoId}', event)">YoutubeEdu-Scratch</div>
-                        <div class="server-option" onclick="changeServer('Youtube-Pro', '/pro-stream/${videoId}', event)">Youtube-Pro</div>
-                        <div class="server-option" onclick="changeServer('Elixir-Network', '/stream-network/${videoId}', event)">Elixir-Network</div>
+                        <div class="server-option" onclick="changeServer('youtube-nocookie', '/nocookie/${safeId}', event)">Youtube-nocookie</div>
+                        <div class="server-option" onclick="changeServer('DL-Pro', '/360/${safeId}', event)">DL-Pro</div>
+                        <div class="server-option" onclick="changeServer('YoutubeEdu-Kahoot', '/kahoot-edu/${safeId}', event)">YoutubeEdu-Kahoot</div>
+                        <div class="server-option" onclick="changeServer('YoutubeEdu-Scratch', '/scratch-edu/${safeId}', event)">YoutubeEdu-Scratch</div>
+                        <div class="server-option" onclick="changeServer('Youtube-Pro', '/pro-stream/${safeId}', event)">Youtube-Pro</div>
+                        <div class="server-option" onclick="changeServer('Elixir-Network', '/stream-network/${safeId}', event)">Elixir-Network</div>
                     </div>
                 </div>
             </div>
@@ -645,13 +736,13 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
         <div class="description-box" id="descriptionBox" onclick="toggleDescription(event)">
             <b>${videoData.videoViews || '0'} 回視聴</b>
             <div class="description-content" id="descriptionContent">
-                ${(videoData.videoDes || '').replace(/\r\n|\n|\r/g, '<br>')}
+                ${escapeHtml(videoData.videoDes || '').replace(/\r\n|\n|\r/g, '<br>')}
             </div>
             <div class="description-show-more" id="descriptionToggleBtn">全文を表示</div>
         </div>
         <div class="comments-section">
-            <h3>コメント ${commentsData.commentCount} 件</h3>
-            ${commentsData.comments.map(c => `<div class="comment-item"><img class="comment-avatar" src="${c.authorThumbnails?.[0]?.url || ''}"><div><span class="comment-author">${c.author}</span><div style="font-size:14px;">${c.content}</div></div></div>`).join('')}
+            <h3>コメント ${escapeHtml(commentsData.commentCount || 0)} 件</h3>
+            ${commentsData.comments.map(c => `<div class="comment-item"><img class="comment-avatar" src="${escapeAttr(c.authorThumbnails?.[0]?.url || '')}"><div><span class="comment-author">${escapeHtml(c.author)}</span><div style="font-size:14px;">${escapeHtml(c.content)}</div></div></div>`).join('')}
         </div>
     </div>
     <div class="sidebar">
@@ -673,7 +764,7 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
     function toggleServerMenu() { document.getElementById('serverMenu').classList.toggle('show'); }
     window.addEventListener('click', function(e) { if (!e.target.closest('.server-dropdown-container')) { const menu = document.getElementById('serverMenu'); if (menu && menu.classList.contains('show')) menu.classList.remove('show'); } });
 
-    const VIDEO_CHANNEL = ${JSON.stringify(videoData.channelName || '')};
+    const VIDEO_CHANNEL = ${jsString(videoData.channelName || '')};
     const SUB_KEY_VIDEO = 'subscribed_' + VIDEO_CHANNEL;
     const subBtn = document.getElementById('subBtn');
     function updateSubBtnUI() {
@@ -699,9 +790,35 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
     }
     updateSubBtnUI();
 
+    const SERVER_ENDPOINTS = {
+        'googlevideo':        '',
+        'youtube-nocookie':   '/nocookie/${safeId}',
+        'DL-Pro':             '/360/${safeId}',
+        'YoutubeEdu-Kahoot':  '/kahoot-edu/${safeId}',
+        'YoutubeEdu-Scratch': '/scratch-edu/${safeId}',
+        'Youtube-Pro':        '/pro-stream/${safeId}',
+        'Elixir-Network': '/stream-network/${safeId}'
+    };
+
+    // 選んだ動画サーバーは cookie にも保存する。
+    // 次に開く動画ページではサーバー側でそのモードのプレイヤーを直接描画できる（= 追加fetch不要）。
+    function rememberServer(serverName) {
+        localStorage.setItem('playbackMode', serverName);
+        document.cookie = 'playbackMode=' + encodeURIComponent(serverName) + '; path=/; max-age=31536000; samesite=lax';
+    }
+
+    function markActiveServerOption(serverName) {
+        const opts = document.querySelectorAll('.server-option');
+        opts.forEach(opt => opt.classList.remove('active'));
+        opts.forEach(opt => {
+            const onclick = opt.getAttribute('onclick') || '';
+            if (onclick.includes("'" + serverName + "'")) opt.classList.add('active');
+        });
+    }
+
     async function changeServer(serverName, endpointPath, event) {
         // --- 修正箇所：サーバー名を localStorage に保存 ---
-        localStorage.setItem('playbackMode', serverName);
+        rememberServer(serverName);
 
         document.getElementById('serverMenu').classList.remove('show');
         const options = document.querySelectorAll('.server-option');
@@ -723,7 +840,9 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
         try {
             let newUrl = '';
             if (serverName === 'googlevideo') {
-                newUrl = "${videoData.stream_url}" === "youtube-nocookie" ? \`https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1\` : "${videoData.stream_url}";
+                const STREAM_URL = ${jsString(videoData.stream_url || "")};
+                const VIDEO_ID = ${jsString(videoId)};
+                newUrl = STREAM_URL === "youtube-nocookie" ? \`https://www.youtube-nocookie.com/embed/\${VIDEO_ID}?autoplay=1\` : STREAM_URL;
             } else if (serverName === 'Youtube-Pro') {
                 newUrl = endpointPath;
             } else {
@@ -765,19 +884,21 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
         } catch (error) { console.error(error); } finally { overlay.classList.remove('active'); }
     }
 
+    const escapeText = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
     async function loadRecommendations() {
-        const params = new URLSearchParams({ title: "${videoData.videoTitle}", channel: "${videoData.channelName}", id: "${videoId}" });
+        const params = new URLSearchParams({ title: ${jsString(videoData.videoTitle)}, channel: ${jsString(videoData.channelName)}, id: ${jsString(videoId)} });
         const res = await fetch(\`/api/recommendations?\${params.toString()}\`);
         const data = await res.json();
         const shorts = data.items.filter(item => item.title.includes('#'));
         const regulars = data.items.filter(item => !item.title.includes('#'));
         document.getElementById('recommendations').innerHTML = regulars.map(item => \`
-            <a href="/video/\${item.id}" class="rec-item">
-                <div class="rec-thumb"><img src="https://i.ytimg.com/vi/\${item.id}/mqdefault.jpg"></div>
+            <a href="/video/\${encodeURIComponent(item.id)}" class="rec-item">
+                <div class="rec-thumb"><img src="https://i.ytimg.com/vi/\${encodeURIComponent(item.id)}/mqdefault.jpg" loading="lazy"></div>
                 <div class="rec-info">
-                    <div class="rec-title">\${item.title}</div>
-                    <div class="rec-meta">\${item.channelTitle}</div>
-                    <div class="rec-meta">\${item.viewCountText || ''}</div>
+                    <div class="rec-title">\${escapeText(item.title)}</div>
+                    <div class="rec-meta">\${escapeText(item.channelTitle)}</div>
+                    <div class="rec-meta">\${escapeText(item.viewCountText || '')}</div>
                 </div>
             </a>
         \`).join('');
@@ -786,36 +907,30 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
             const grid = document.getElementById('shortsGrid');
             shelf.style.display = 'block';
             grid.innerHTML = shorts.slice(0, 4).map(item => \`
-                <a href="/video/\${item.id}" class="short-card">
-                    <div class="short-thumb"><img src="https://i.ytimg.com/vi/\${item.id}/hq720.jpg"></div>
+                <a href="/video/\${encodeURIComponent(item.id)}" class="short-card">
+                    <div class="short-thumb"><img src="https://i.ytimg.com/vi/\${encodeURIComponent(item.id)}/hq720.jpg" loading="lazy"></div>
                     <div class="short-info">
-                        <div class="short-title">\${item.title}</div>
-                        <div class="short-views">\${item.viewCountText || ''}</div>
+                        <div class="short-title">\${escapeText(item.title)}</div>
+                        <div class="short-views">\${escapeText(item.viewCountText || '')}</div>
                     </div>
                 </a>
             \`).join('');
         }
     }
-    window.onload = () => {
+    // サーバー側が描画済みのモード。これと違うモードが保存されていた時だけ差し替える。
+    const RENDERED_MODE = ${jsString(renderedMode)};
+
+    // window.onload は全リソース（画像・フォント）の完了を待ってしまうため使わない。
+    // DOMContentLoaded ならHTML解析直後に動き出し、プレイヤーは既にバッファリング済み。
+    document.addEventListener('DOMContentLoaded', () => {
+        markActiveServerOption(RENDERED_MODE);
         loadRecommendations();
 
-        // --- 修正箇所：保存された再生方法を即座に反映 ---
         const savedMode = localStorage.getItem('playbackMode') || 'googlevideo';
-        const serverEndpoints = {
-            'googlevideo':        '',
-            'youtube-nocookie':   '/nocookie/${videoId}',
-            'DL-Pro':             '/360/${videoId}',
-            'YoutubeEdu-Kahoot':  '/kahoot-edu/${videoId}',
-            'YoutubeEdu-Scratch': '/scratch-edu/${videoId}',
-            'Youtube-Pro':        '/pro-stream/${videoId}',
-            'Elixir-Network': '/stream-network/${videoId}'
-        };
-        const serverName = serverEndpoints.hasOwnProperty(savedMode) ? savedMode : 'googlevideo';
-        const endpointPath = serverEndpoints[serverName];
-
-        // 初期サーバー選択で起動
-        changeServer(serverName, endpointPath, null);
-    };
+        if (savedMode !== RENDERED_MODE && SERVER_ENDPOINTS.hasOwnProperty(savedMode)) {
+            changeServer(savedMode, SERVER_ENDPOINTS[savedMode], null);
+        }
+    });
 
     const searchInput = document.getElementById('searchInput');
     const autocompleteDropdown = document.getElementById('autocompleteDropdown');
@@ -1071,7 +1186,7 @@ app.get('/pro-stream/:videoId', (req, res) => {
 </div>
 
 <script>
-const VIDEO_ID = ${JSON.stringify(videoId)};
+const VIDEO_ID = ${jsString(videoId)};
 const ENDPOINTS = [
   {name:'/scratch-edu', path:'/scratch-edu/' + VIDEO_ID},
   {name:'/kahoot-edu', path:'/kahoot-edu/' + VIDEO_ID},
