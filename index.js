@@ -8,7 +8,7 @@ const https = require("https");
 const fs = require('fs');
 const { StreamResolver, normalizeComments } = require("./lib/stream-resolver");
 const { YtMetadata, textOf } = require("./lib/yt-innertube");
-const { buildSearchParams, filtersFromQuery, CHOICES: SEARCH_CHOICES } = require("./lib/search-filters");
+const { buildSearchParams, filtersFromQuery } = require("./lib/search-filters");
 const { createProxiedFetch, proxiesFromEnv, parseProxyList } = require("./lib/proxy-tunnel");
 const { ProxyHarvester } = require("./lib/proxy-sources");
 

@@ -85,9 +85,9 @@ test('home.html escapes external metadata before injecting it into innerHTML', (
   for (const raw of ['${item.title}', '${item.channelTitle}', '${item.viewCountText}', '${item.lengthText}']) {
     assert.equal(home.split(raw).length - 1, 0, `${raw} は必ず esc() を通す`);
   }
-  // アバター URL は常に safeUrl() を通る
+  // アバター URL は常に safeUrl() を通る（カード描画は createVideoCard() に1本化した）
   const avatars = home.match(/const avatarUrl = .*/g) || [];
-  assert.equal(avatars.length, 2);
+  assert.equal(avatars.length, 1, 'カード描画は1か所だけ');
   for (const line of avatars) assert.match(line, /safeUrl\(/);
 });
 

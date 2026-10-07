@@ -1677,6 +1677,55 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       updateShortsToggleUI();
     });
 
+    /**
+     * 動画カードを1枚作る（検索結果とおすすめ欄でまったく同じだったので1つにまとめた）
+     * アイコンが無いときは自前の /api/avatar にフォールバックする
+     * （以前は ui-avatars.com を直に叩いていたが、ブロック環境では落ちてアイコンが消えていた）
+     */
+    function createVideoCard(item) {
+      const card = document.createElement('a');
+      card.className = 'video-card';
+      card.href = `/video/${item.id}`;
+      const thumbUrl = getThumbUrl(item.id, 'mq');
+      const channel = item.channelTitle || '';
+      const viewText = item.viewCountText || '';
+      const published = item.publishedTimeText || '';
+      const initial = channel ? channel[0].toUpperCase() : 'C';
+      // チャンネルアバター画像URL（無ければ /api/avatar が頭文字を返す）
+      const avatarUrl = safeUrl(item.channelThumbnail || item.channelImage || '');
+      const subKey = 'subscribed_' + channel;
+      const isSub = localStorage.getItem(subKey) === 'true';
+
+      card.innerHTML = `
+        <div class="thumb">
+          <img src="${esc(thumbUrl)}" loading="lazy" alt="${esc(item.title || '動画')}">
+          ${item.lengthText ? `<div class="duration-badge">${esc(item.lengthText)}</div>` : ''}
+        </div>
+        <div class="meta">
+          <a href="/channel/${encodeURIComponent(channel)}" class="channel-avatar" data-initial="${esc(initial)}" onclick="event.stopPropagation()" style="text-decoration:none;">
+            <span class="avatar-initial">${esc(initial)}</span>
+            ${avatarUrl ? `<img src="${esc(avatarUrl)}" alt="${esc(channel)}" onload="this.classList.add('loaded')" onerror="this.remove()">` : ''}
+          </a>
+          <div class="details">
+            <h3>${esc(item.title || '')}</h3>
+            <a href="/channel/${encodeURIComponent(channel)}" class="channel-name" onclick="event.stopPropagation()" style="text-decoration:none;color:var(--text-muted);">${esc(channel)}</a>
+            <div class="video-stats">${esc(viewText)}${viewText && published ? ' • ' : ''}${esc(published || item.publishedTimeText || '')}</div>
+          </div>
+          <button class="card-menu-btn" aria-label="メニュー" data-id="${esc(item.id)}" data-title="${esc(item.title||'')}" data-channel="${esc(channel)}" data-views="${esc(viewText)}" data-published="${esc(published)}">⋮</button>
+        </div>
+      `;
+      if (!avatarUrl) {
+        const avatarEl = card.querySelector('.channel-avatar');
+        const img = document.createElement('img');
+        img.src = `/api/avatar?name=${encodeURIComponent(channel)}`;
+        img.alt = channel;
+        img.onload = () => img.classList.add('loaded');
+        img.onerror = () => img.remove();
+        avatarEl.appendChild(img);
+      }
+      return card;
+    }
+
     async function loadContent(query = 'trending', page = 0) {
       if (isFetching) return;
       isFetching = true;
@@ -1801,49 +1850,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           if (!item || !item.id || displayedIds.has(item.id)) return;
           displayedIds.add(item.id);
 
-          const card = document.createElement('a');
-          card.className = 'video-card';
-          card.href = `/video/${item.id}`;
-          const thumbUrl = getThumbUrl(item.id, 'mq');
-          const channel = item.channelTitle || '';
-          const viewText = item.viewCountText || '';
-          const published = item.publishedTimeText || '';
-          const initial = channel ? channel[0].toUpperCase() : 'C';
-          // チャンネルアバター画像URL（無ければ /api/avatar が頭文字を返す）
-          const avatarUrl = safeUrl(item.channelThumbnail || item.channelImage || '');
-          const subKey = 'subscribed_' + channel;
-          const isSub = localStorage.getItem(subKey) === 'true';
-
-          card.innerHTML = `
-            <div class="thumb">
-              <img src="${esc(thumbUrl)}" loading="lazy" alt="${esc(item.title || '動画')}">
-              ${item.lengthText ? `<div class="duration-badge">${esc(item.lengthText)}</div>` : ''}
-            </div>
-            <div class="meta">
-              <a href="/channel/${encodeURIComponent(channel)}" class="channel-avatar" data-initial="${esc(initial)}" onclick="event.stopPropagation()" style="text-decoration:none;">
-                <span class="avatar-initial">${esc(initial)}</span>
-                ${avatarUrl ? `<img src="${esc(avatarUrl)}" alt="${esc(channel)}" onload="this.classList.add('loaded')" onerror="this.remove()">` : ''}
-              </a>
-              <div class="details">
-                <h3>${esc(item.title || '')}</h3>
-                <a href="/channel/${encodeURIComponent(channel)}" class="channel-name" onclick="event.stopPropagation()" style="text-decoration:none;color:var(--text-muted);">${esc(channel)}</a>
-                <div class="video-stats">${esc(viewText)}${viewText && published ? ' • ' : ''}${esc(published || item.publishedTimeText || '')}</div>
-              </div>
-              <button class="card-menu-btn" aria-label="メニュー" data-id="${esc(item.id)}" data-title="${esc(item.title||'')}" data-channel="${esc(channel)}" data-views="${esc(viewText)}" data-published="${esc(published)}">⋮</button>
-            </div>
-          `;
-          // アバター画像がない場合は自前のプレースホルダを出す
-          if (!avatarUrl) {
-            const avatarEl = card.querySelector('.channel-avatar');
-            const img = document.createElement('img');
-            // ui-avatars.com は外部サービスなので、ブロック環境では画像が落ちてアイコンが消えていた。自前の端点を使う。
-            img.src = `/api/avatar?name=${encodeURIComponent(channel)}`;
-            img.alt = channel;
-            img.onload = () => img.classList.add('loaded');
-            img.onerror = () => img.remove();
-            avatarEl.appendChild(img);
-          }
-          videoGrid.appendChild(card);
+          videoGrid.appendChild(createVideoCard(item));
         });
 
       } catch (err) {
@@ -2252,46 +2259,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
         normals.forEach(item => {
           if (!item || !item.id || displayedIds.has(item.id)) return;
           displayedIds.add(item.id);
-          const card = document.createElement('a');
-          card.className = 'video-card';
-          card.href = `/video/${item.id}`;
-          const thumbUrl = getThumbUrl(item.id, 'mq');
-          const channel = item.channelTitle || '';
-          const viewText = item.viewCountText || '';
-          const published = item.publishedTimeText || '';
-          const initial = channel ? channel[0].toUpperCase() : 'C';
-          const avatarUrl = safeUrl(item.channelThumbnail || item.channelImage || '');
-          const subKey = 'subscribed_' + channel;
-          const isSub = localStorage.getItem(subKey) === 'true';
-          card.innerHTML = `
-            <div class="thumb">
-              <img src="${esc(thumbUrl)}" loading="lazy" alt="${esc(item.title || '動画')}">
-              ${item.lengthText ? `<div class="duration-badge">${esc(item.lengthText)}</div>` : ''}
-            </div>
-            <div class="meta">
-              <a href="/channel/${encodeURIComponent(channel)}" class="channel-avatar" data-initial="${esc(initial)}" onclick="event.stopPropagation()" style="text-decoration:none;">
-                <span class="avatar-initial">${esc(initial)}</span>
-                ${avatarUrl ? `<img src="${esc(avatarUrl)}" alt="${esc(channel)}" onload="this.classList.add('loaded')" onerror="this.remove()">` : ''}
-              </a>
-              <div class="details">
-                <h3>${esc(item.title || '')}</h3>
-                <a href="/channel/${encodeURIComponent(channel)}" class="channel-name" onclick="event.stopPropagation()" style="text-decoration:none;color:var(--text-muted);">${esc(channel)}</a>
-                <div class="video-stats">${esc(viewText)}${viewText && published ? ' • ' : ''}${esc(published || item.publishedTimeText || '')}</div>
-              </div>
-              <button class="card-menu-btn" aria-label="メニュー" data-id="${esc(item.id)}" data-title="${esc(item.title||'')}" data-channel="${esc(channel)}" data-views="${esc(viewText)}" data-published="${esc(published)}">⋮</button>
-            </div>
-          `;
-          if (!avatarUrl) {
-            const avatarEl = card.querySelector('.channel-avatar');
-            const img = document.createElement('img');
-            // ui-avatars.com は外部サービスなので、ブロック環境では画像が落ちてアイコンが消えていた。自前の端点を使う。
-            img.src = `/api/avatar?name=${encodeURIComponent(channel)}`;
-            img.alt = channel;
-            img.onload = () => img.classList.add('loaded');
-            img.onerror = () => img.remove();
-            avatarEl.appendChild(img);
-          }
-          videoGrid.appendChild(card);
+          videoGrid.appendChild(createVideoCard(item));
         });
 
       } catch (err) {

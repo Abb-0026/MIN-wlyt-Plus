@@ -1551,7 +1551,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           const viewText = item.viewCountText || '';
           const published = item.publishedTimeText || '';
           const initial = channel ? channel[0].toUpperCase() : 'C';
-          // チャンネルアバター画像URL（ui-avatars フォールバック）
+          // チャンネルアバター画像URL（無ければ /api/avatar が頭文字を返す）
           const avatarUrl = item.channelThumbnail || item.channelImage || '';
           const subKey = 'subscribed_' + channel;
           const isSub = localStorage.getItem(subKey) === 'true';
@@ -1574,11 +1574,11 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
               <button class="card-menu-btn" aria-label="メニュー" data-id="${item.id}" data-title="${(item.title||'').replace(/"/g,'&quot;')}" data-channel="${channel.replace(/"/g,'&quot;')}" data-views="${viewText}" data-published="${published}">⋮</button>
             </div>
           `;
-          // アバター画像がない場合はui-avatarsから取得
+          // アバター画像がない場合は自前のプレースホルダを出す
           if (!avatarUrl) {
             const avatarEl = card.querySelector('.channel-avatar');
             const img = document.createElement('img');
-            img.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(channel)}&background=random&color=fff&size=64&bold=true`;
+            img.src = `/api/avatar?name=${encodeURIComponent(channel)}`;
             img.alt = channel;
             img.onload = () => img.classList.add('loaded');
             img.onerror = () => img.remove();
@@ -2000,7 +2000,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           if (!avatarUrl) {
             const avatarEl = card.querySelector('.channel-avatar');
             const img = document.createElement('img');
-            img.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(channel)}&background=random&color=fff&size=64&bold=true`;
+            img.src = `/api/avatar?name=${encodeURIComponent(channel)}`;
             img.alt = channel;
             img.onload = () => img.classList.add('loaded');
             img.onerror = () => img.remove();
