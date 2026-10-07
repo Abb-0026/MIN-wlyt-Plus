@@ -1015,6 +1015,92 @@
   align-items: center; 
 }
 
+/* ── 検索の絞り込み ───────────────────────────── */
+.filter-bar {
+  position: relative;
+  padding: 8px 16px 0;
+  background: var(--bg);
+}
+.filter-bar[hidden] { display: none; }
+.filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--chip-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.filter-toggle:hover { background: var(--hover); }
+.filter-toggle svg { fill: currentColor; }
+.filter-count {
+  background: var(--red);
+  color: #fff;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 6px;
+  min-width: 16px;
+  text-align: center;
+}
+.filter-panel {
+  margin-top: 8px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.filter-panel[hidden] { display: none; }
+.filter-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.filter-group::before {
+  content: attr(data-label);
+  color: var(--text-sec);
+  font-size: 11px;
+  width: 56px;
+  flex-shrink: 0;
+}
+.filter-opt {
+  background: var(--chip-bg);
+  color: var(--text);
+  border: 1px solid transparent;
+  border-radius: 16px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.filter-opt:hover { background: var(--hover); }
+.filter-opt[aria-pressed="true"] {
+  background: var(--text);
+  color: var(--bg);
+  border-color: var(--text);
+}
+.filter-clear {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  color: var(--text-sub);
+  font-size: 12px;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 2px 0;
+}
+.filter-note {
+  padding: 8px 16px 0;
+  color: var(--text-sec);
+  font-size: 12px;
+}
+
 .chips-extra-content {
   margin-left: auto; 
   padding-left: 16px;
@@ -1297,6 +1383,23 @@
 </div>
       </div>
 
+      <!-- 絞り込み（期間・長さ・種類・並び順）。検索のときだけ出る -->
+      <div class="filter-bar" id="filterBar" hidden>
+        <button class="filter-toggle" id="filterToggle" type="button" aria-expanded="false" aria-controls="filterPanel">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 5h18v2H3V5zm3 6h12v2H6v-2zm3 6h6v2H9v-2z"/></svg>
+          <span>絞り込み</span>
+          <span class="filter-count" id="filterCount" hidden>0</span>
+        </button>
+        <div class="filter-panel" id="filterPanel" hidden>
+          <div class="filter-group" data-key="sort" role="group" aria-label="並び順"></div>
+          <div class="filter-group" data-key="date" role="group" aria-label="投稿時期"></div>
+          <div class="filter-group" data-key="duration" role="group" aria-label="動画の長さ"></div>
+          <div class="filter-group" data-key="type" role="group" aria-label="種類"></div>
+          <button class="filter-clear" id="filterClear" type="button">絞り込みを解除</button>
+        </div>
+        <div class="filter-note" id="filterNote" hidden></div>
+      </div>
+
       <div class="content-area">
         <div id="shortsSection" class="shorts-section" style="display:none;">
           <div class="section-header">
@@ -1404,6 +1507,109 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
     let isFetching = false;
     let currentPage = 0;
     let currentQuery = 'trending';
+
+    /* ── 検索の絞り込み（サーバ側の lib/search-filters.js と同じ一覧） ── */
+    const SEARCH_FILTERS = {
+      sort:     [{ value: 'relevance', label: '関連度' }, { value: 'date', label: '投稿日' }, { value: 'views', label: '再生数' }, { value: 'rating', label: '評価' }],
+      date:     [{ value: '', label: '指定なし' }, { value: 'today', label: '今日' }, { value: 'thisWeek', label: '今週' }, { value: 'thisMonth', label: '今月' }, { value: 'thisYear', label: '今年' }],
+      duration: [{ value: '', label: '指定なし' }, { value: 'short', label: '4分未満' }, { value: 'long', label: '20分以上' }],
+      type:     [{ value: '', label: '指定なし' }, { value: 'video', label: '動画' }, { value: 'channel', label: 'チャンネル' }, { value: 'playlist', label: 'プレイリスト' }],
+    };
+    const FILTER_LABELS = { sort: '並び順', date: '投稿時期', duration: '長さ', type: '種類' };
+    let currentFilters = { sort: 'relevance', date: '', duration: '', type: '' };
+    let filterNote = '';
+
+    function activeFilterCount() {
+      return Object.keys(currentFilters).filter(k => k === 'sort'
+        ? currentFilters.sort !== 'relevance'
+        : !!currentFilters[k]).length;
+    }
+
+    /** 検索のURLを1か所で作る（絞り込みを付け忘れないため） */
+    function searchEndpoint(q, page) {
+      let ep = `/api/search?q=${encodeURIComponent(q)}&page=${page}`;
+      for (const key of ['sort', 'date', 'duration', 'type']) {
+        const v = currentFilters[key];
+        if (!v) continue;
+        if (key === 'sort' && v === 'relevance') continue;
+        ep += `&${key}=${encodeURIComponent(v)}`;
+      }
+      return ep;
+    }
+
+    /** ブラウザのURL（絞り込み付き） */
+    function searchUrl(q) {
+      const qs = new URLSearchParams({ q });
+      for (const key of ['sort', 'date', 'duration', 'type']) {
+        const v = currentFilters[key];
+        if (!v) continue;
+        if (key === 'sort' && v === 'relevance') continue;
+        qs.set(key, v);
+      }
+      return `/search?${qs.toString()}`;
+    }
+
+    /** URLの絞り込みを読み戻す */
+    function filtersFromUrl() {
+      const p = new URLSearchParams(window.location.search);
+      const pick = (key, list) => {
+        const v = p.get(key);
+        return list.some(o => o.value === v) ? v : (key === 'sort' ? 'relevance' : '');
+      };
+      currentFilters = {
+        sort: pick('sort', SEARCH_FILTERS.sort),
+        date: pick('date', SEARCH_FILTERS.date),
+        duration: pick('duration', SEARCH_FILTERS.duration),
+        type: pick('type', SEARCH_FILTERS.type),
+      };
+    }
+
+    function renderFilterBar() {
+      const bar = document.getElementById('filterBar');
+      if (!bar) return;
+      // トレンド（ホーム）には絞り込みを出さない
+      bar.hidden = (currentQuery === 'trending');
+      document.getElementById('filterPanel').hidden = !filterPanelOpen;
+
+      for (const group of document.querySelectorAll('.filter-group')) {
+        const key = group.dataset.key;
+        group.setAttribute('data-label', FILTER_LABELS[key] || '');
+        group.innerHTML = SEARCH_FILTERS[key].map(opt => {
+          const pressed = (currentFilters[key] || (key === 'sort' ? 'relevance' : '')) === opt.value;
+          return `<button class="filter-opt" type="button" data-key="${esc(key)}" data-value="${esc(opt.value)}" aria-pressed="${pressed}">${esc(opt.label)}</button>`;
+        }).join('');
+      }
+
+      const n = activeFilterCount();
+      const badge = document.getElementById('filterCount');
+      badge.hidden = n === 0;
+      badge.textContent = String(n);
+    }
+
+    let filterPanelOpen = false;
+    function setupFilterBar() {
+      const bar = document.getElementById('filterBar');
+      if (!bar) return;
+      document.getElementById('filterToggle').addEventListener('click', () => {
+        filterPanelOpen = !filterPanelOpen;
+        document.getElementById('filterToggle').setAttribute('aria-expanded', String(filterPanelOpen));
+        renderFilterBar();
+      });
+      document.getElementById('filterClear').addEventListener('click', () => {
+        currentFilters = { sort: 'relevance', date: '', duration: '', type: '' };
+        renderFilterBar();
+        loadContent(currentQuery, 0);
+      });
+      document.getElementById('filterPanel').addEventListener('click', (e) => {
+        const btn = e.target.closest('.filter-opt');
+        if (!btn) return;
+        const key = btn.dataset.key;
+        currentFilters[key] = btn.dataset.value;
+        renderFilterBar();
+        loadContent(currentQuery, 0);
+      });
+      renderFilterBar();
+    }
     let shortsExpanded = true;
 
     // Sidebar toggle
@@ -1487,10 +1693,11 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       const isDefault = query === 'trending';
       const endpoint = isDefault
         ? `/api/trending?page=${page}`
-        : `/api/search?q=${encodeURIComponent(query)}&page=${page}`;
+        : searchEndpoint(query, page);
 
       try {
         let items = await fetchEndpoint(endpoint);
+        filterNote = (items && items.filterNote) || '';
         items = normalizeAndFilterList(items);
 
         if (page === 0) {
@@ -1521,6 +1728,13 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           }
         }
 
+        renderFilterBar();
+        const noteEl = document.getElementById('filterNote');
+        if (noteEl) {
+          noteEl.textContent = filterNote || '';
+          noteEl.hidden = !filterNote;
+        }
+
         if (items.length === 0 && page === 0) {
           videoGrid.innerHTML = '<p class="empty">動画が見つかりませんでした。</p>';
         }
@@ -1539,7 +1753,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
             const needed = 6;
             const addedShortIds = new Set(shorts.map(s => s.id));
             for (let p = 1; p <= 3 && shorts.length < needed; p++) {
-              const ep = `/api/search?q=${encodeURIComponent(currentQuery)}&page=${p}`;
+              const ep = searchEndpoint(currentQuery, p);
               try {
                 const resItems = await fetchEndpoint(ep);
                 const norm = normalizeAndFilterList(resItems);
@@ -1595,7 +1809,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           const viewText = item.viewCountText || '';
           const published = item.publishedTimeText || '';
           const initial = channel ? channel[0].toUpperCase() : 'C';
-          // チャンネルアバター画像URL（ui-avatars フォールバック）
+          // チャンネルアバター画像URL（無ければ /api/avatar が頭文字を返す）
           const avatarUrl = safeUrl(item.channelThumbnail || item.channelImage || '');
           const subKey = 'subscribed_' + channel;
           const isSub = localStorage.getItem(subKey) === 'true';
@@ -1618,11 +1832,12 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
               <button class="card-menu-btn" aria-label="メニュー" data-id="${esc(item.id)}" data-title="${esc(item.title||'')}" data-channel="${esc(channel)}" data-views="${esc(viewText)}" data-published="${esc(published)}">⋮</button>
             </div>
           `;
-          // アバター画像がない場合はui-avatarsから取得
+          // アバター画像がない場合は自前のプレースホルダを出す
           if (!avatarUrl) {
             const avatarEl = card.querySelector('.channel-avatar');
             const img = document.createElement('img');
-            img.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(channel)}&background=random&color=fff&size=64&bold=true`;
+            // ui-avatars.com は外部サービスなので、ブロック環境では画像が落ちてアイコンが消えていた。自前の端点を使う。
+            img.src = `/api/avatar?name=${encodeURIComponent(channel)}`;
             img.alt = channel;
             img.onload = () => img.classList.add('loaded');
             img.onerror = () => img.remove();
@@ -1649,7 +1864,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       currentPage = 0;
       isPersonalized = false;
       document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-      history.pushState(null, '', `/search?q=${encodeURIComponent(q)}`);
+      history.pushState(null, '', searchUrl(q));
       loadContent(q, 0);
     };
 
@@ -1785,26 +2000,51 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
 
     // Autocomplete Logic
     const autocompleteDropdown = document.getElementById('autocompleteDropdown');
-    let suggestScript = null;
     let autocompleteItems = [];
     let autocompleteSelectedIndex = -1;
 
-    window.ytSuggestCallback = function(data) {
-      const suggestions = data[1];
-      renderAutocomplete(suggestions);
-    };
+    /**
+     * 検索候補はサーバ経由（/api/suggest）で取る。
+     * 以前は suggestqueries.google.com へ JSONP で直に行っていたが、
+     * IPブロック環境ではそれも落ちて候補が一切出なかった。
+     * 取れなかったときは端末の検索履歴から補う（オフラインでも候補は出る）。
+     */
+    let suggestSeq = 0;
 
-    function fetchSuggestions(q) {
+    function localSuggestions(q) {
+      const needle = q.trim().toLowerCase();
+      if (!needle) return [];
+      return libGet(LIB_SEARCH_HISTORY)
+        .map(x => x && x.query)
+        .filter(text => text && text.toLowerCase().includes(needle) && text.toLowerCase() !== needle)
+        .slice(0, 8);
+    }
+
+    async function fetchSuggestions(q) {
       if (!q.trim()) {
         autocompleteDropdown.classList.remove('show');
         return;
       }
-      if (suggestScript) {
-        suggestScript.remove();
+      const seq = ++suggestSeq;
+      // まず履歴を出しておく（外に取りに行くのを待たせない）
+      const local = localSuggestions(q);
+      if (local.length) renderAutocomplete(local.map(text => [text, 0]));
+
+      try {
+        const res = await fetch(`/api/suggest?q=${encodeURIComponent(q)}`, { headers: { Accept: 'application/json' } });
+        if (!res.ok) throw new Error('suggest failed');
+        const data = await res.json();
+        if (seq !== suggestSeq) return; // 新しい入力が来ていたら古い結果は捨てる
+        const items = Array.isArray(data.items) ? data.items : [];
+        if (items.length) {
+          renderAutocomplete(items.map(text => [text, 0]));
+          return;
+        }
+      } catch (e) {
+        if (seq !== suggestSeq) return;
       }
-      suggestScript = document.createElement('script');
-      suggestScript.src = `https://suggestqueries.google.com/complete/search?client=youtube&ds=yt&q=${encodeURIComponent(q)}&jsonp=ytSuggestCallback`;
-      document.body.appendChild(suggestScript);
+      // 外から取れなければ履歴だけで出す
+      if (!local.length) autocompleteDropdown.classList.remove('show');
     }
 
     let searchTimeout;
@@ -2044,7 +2284,8 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           if (!avatarUrl) {
             const avatarEl = card.querySelector('.channel-avatar');
             const img = document.createElement('img');
-            img.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(channel)}&background=random&color=fff&size=64&bold=true`;
+            // ui-avatars.com は外部サービスなので、ブロック環境では画像が落ちてアイコンが消えていた。自前の端点を使う。
+            img.src = `/api/avatar?name=${encodeURIComponent(channel)}`;
             img.alt = channel;
             img.onload = () => img.classList.add('loaded');
             img.onerror = () => img.remove();
@@ -2065,6 +2306,8 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
     let isPersonalized = true;
 
     window.onload = () => {
+      filtersFromUrl();
+      setupFilterBar();
       const params = new URLSearchParams(window.location.search);
       const q = params.get('q');
       if (q) {

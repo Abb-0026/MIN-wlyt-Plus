@@ -26,6 +26,8 @@ YT_META_DEBUG=1
 | `YT_META_PROXY_ALLOW_PRIVATE` | `0` | `1` で 127.0.0.1 / 私有IP のプロキシも使う（**ローカル検証専用**） |
 | `YT_META_HOST` | `https://www.youtube.com` | 接続先（ローカルのモック検証用。本番では触らない） |
 | `YT_META_TLS_REJECT` | `1` | `0` で証明書検証を無効化（**ローカル検証用。本番では絶対に使わない**） |
+| `YT_SUGGEST_URLS` | Google / clients6 の2系統 | 検索候補（`/api/suggest`）の取得元（カンマ区切り） |
+| `YT_LEGACY_TIMEOUT` | `4000` | 従来経路（`youtube-search-api`）の打ち切り時間 ms（最小 300） |
 
 `/api/meta-stats` は `YT_META_DEBUG=1` のときだけ応答します。既定では 404 なので、
 本番で不用意にキャッシュ統計や visitorId を外部へ出すことはありません。
@@ -219,6 +221,28 @@ node scripts/verify-meta.js https://your-app.example.com --video=dQw4w9WgXcQ
 | コメントの「続きを読む」が 400 | 継続トークンの二重エンコード | 既に正規化済み。出た場合は `/api/comments/:id?continuation=` に渡す値を確認 |
 
 ---
+
+### 検索が0件になる / 埋まるまで遅い
+
+1. `/api/search?q=...` の応答の `source` を見る
+   - `innertube` … 高速経路で取れた
+   - `innertube-retry` … 1回目はプロキシが悪く、再挑戦で取れた（一時的に遅くなるが正常）
+   - `mixed` … 高速経路の分が少なかったので従来経路で補った
+   - `legacy` … 従来経路だけで返した
+   - `none` / `error` … どちらも0件
+2. `YT_META_DEBUG=1` で `[legacy] dead for a while` が出ていたら、従来経路は冷却中（5分）。
+   ブロック環境では直アクセスを増やさないための**正常な動作**です。
+3. ずっと `legacy` から戻らない場合は `/api/meta-stats` の `meta.circuitOpen` を確認。
+   `true` なら YouTube 本体に拒否されているので、プロキシの自動取得が効いているか
+   （`proxySources.lastAdded`）を見てください。
+
+### 検索候補（サジェスト）が出ない
+
+- サーバ側の `/api/suggest?q=...` を直接叩いて `source` を見る
+  - `remote` … 取れた
+  - `cache` … キャッシュ（10分）
+  - `none` … どの候補元にも届かなかった。画面は端末の検索履歴から候補を出します
+- 候補元を変えたい場合は `YT_SUGGEST_URLS` を指定する
 
 ## 6. 手元で「IPブロック環境」を再現する
 

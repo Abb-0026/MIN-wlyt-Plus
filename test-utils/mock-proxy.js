@@ -42,8 +42,52 @@ function renderer(id, title, extra = {}) {
   };
 }
 
+/**
+ * lockupViewModel の最小フィクスチャ（2024年秋以降の検索結果の実形）
+ * アバターは metadataParts[0].avatar.image.sources に入る。
+ * 既定では出さない（既存テストの件数を変えないため）。
+ */
+function lockup(id, title, extra = {}) {
+  return Object.assign({
+    contentType: 'LOCKUP_CONTENT_TYPE_VIDEO',
+    contentId: id,
+    metadata: {
+      lockupMetadataViewModel: {
+        title: { content: title },
+        metadata: {
+          contentMetadataViewModel: {
+            metadataRows: [{
+              metadataParts: [
+                {
+                  text: { content: 'Ch' },
+                  avatar: {
+                    image: {
+                      sources: [
+                        { url: 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg' },
+                        { url: 'https://yt3.ggpht.com/ytc/AAAA-lookup=s88-c-k-c0x00ffffff-no-rj' },
+                      ],
+                    },
+                  },
+                },
+                { text: { content: '1.2万回視聴' } },
+                { text: { content: '3日前' } },
+              ],
+            }],
+          },
+        },
+      },
+    },
+    contentImage: {
+      thumbnailViewModel: {
+        image: { sources: [{ url: 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg' }] },
+      },
+      thumbnailBadgeViewModel: { thumbnailBadgeAtoms: 'TEXT', text: '10:31' },
+    },
+  }, extra);
+}
+
 /** 偽 YouTube（youtubei/v1 の最小限の応答） */
-function createFakeYouTube({ cert, onRequest } = {}) {
+function createFakeYouTube({ cert, onRequest, lockups = false } = {}) {
   const requests = [];
   const sockets = [];
   const server = https.createServer(cert || makeSelfSignedCert(), (req, res) => {
@@ -57,6 +101,29 @@ function createFakeYouTube({ cert, onRequest } = {}) {
       requests.push({ method: req.method, url: req.url, payload, headers: req.headers });
       if (typeof onRequest === 'function') onRequest(requests[requests.length - 1]);
 
+      // ハンドルページ（/@name）。チャンネルID解決の検証用。
+      // 既定では出さない（既存テストの挙動を変えないため）。
+      if (lockups && req.url.startsWith('/@')) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<html><head><link rel="canonical" href="https://www.youtube.com/channel/UCmockmockmockmockmockm1">'
+          + '</head><body>{"externalId":"UCmockmockmockmockmockm1"}</body></html>');
+        return;
+      }
+
+      // 検索候補（サジェスト）。/api/suggest の検証用。
+      if (req.url.startsWith('/complete/search')) {
+        const q = new URL(req.url, 'https://x').searchParams.get('q') || '';
+        const body = JSON.stringify([q, [
+          [`${q} とは`, 0], [`${q} まとめ`, 0], [`${q} やり方`, 0],
+        ]]);
+        const wrap = req.url.includes('jsonp=')
+          ? `${new URL(req.url, 'https://x').searchParams.get('jsonp')}(${body})`
+          : body;
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(wrap);
+        return;
+      }
+
       const endpoint = String(req.url || '').split('/').pop().split('?')[0];
       let out;
       if (endpoint === 'search') {
@@ -67,11 +134,45 @@ function createFakeYouTube({ cert, onRequest } = {}) {
                 sectionListRenderer: {
                   contents: [{
                     itemSectionRenderer: {
-                      contents: [renderer('aaaaaaaaaaa', 'プロキシ経由の動画')],
+                      contents: [
+                        renderer('aaaaaaaaaaa', 'プロキシ経由の動画'),
+                        ...(lockups ? [{ lockupViewModel: lockup('ccccccccccc', 'ロックアップ経由の動画') }] : []),
+                      ],
                     },
                   }],
                 },
               },
+            },
+          },
+        };
+      } else if (endpoint === 'browse' && payload && String(payload.browseId || '').startsWith('UC')) {
+        out = {
+          metadata: {
+            channelMetadataRenderer: {
+              title: 'モックチャンネル',
+              description: '検証用の説明文',
+              subscriberCountText: '12.3万人',
+              videoCountText: '345本',
+              avatar: { thumbnails: [{ url: 'https://yt3.ggpht.com/ytc/mock-avatar=s176-c-k-c0x00ffffff-no-rj', width: 176, height: 176 }] },
+              channelId: payload.browseId,
+            },
+          },
+          contents: {
+            twoColumnBrowseResultsRenderer: {
+              tabs: [{
+                tabRenderer: {
+                  selected: true,
+                  content: {
+                    richGridRenderer: {
+                      contents: [{
+                        richItemRenderer: {
+                          content: renderer('eeeeeeeeeee', 'チャンネルの動画'),
+                        },
+                      }],
+                    },
+                  },
+                },
+              }],
             },
           },
         };
@@ -84,11 +185,14 @@ function createFakeYouTube({ cert, onRequest } = {}) {
                   selected: true,
                   content: {
                     richGridRenderer: {
-                      contents: [{
-                        richItemRenderer: {
-                          content: renderer('bbbbbbbbbbb', 'トレンド経由の動画'),
+                      contents: [
+                        {
+                          richItemRenderer: {
+                            content: renderer('bbbbbbbbbbb', 'トレンド経由の動画'),
+                          },
                         },
-                      }],
+                        ...(lockups ? [{ richItemRenderer: { content: { lockupViewModel: lockup('ddddddddddd', 'ロックアップ経由のトレンド') } } }] : []),
+                      ],
                     },
                   },
                 },
@@ -275,7 +379,7 @@ function createSocksProxy({ username = '', password = '', blocked = false } = {}
 }
 
 /** まとめて起動する。close() で全部止める */
-async function startMockStack({ socksAuth = null, blockedSocks = false } = {}) {
+async function startMockStack({ socksAuth = null, blockedSocks = false, lockups = false } = {}) {
   const cert = makeSelfSignedCert();
   const servers = {};
 
@@ -284,7 +388,7 @@ async function startMockStack({ socksAuth = null, blockedSocks = false } = {}) {
     server.listen(port, '127.0.0.1', () => resolve(server.address().port));
   });
 
-  const origin = createFakeYouTube({ cert });
+  const origin = createFakeYouTube({ cert, lockups });
   const goodProxy = createConnectProxy();
   const blockedProxy = createConnectProxy({ blocked: true });
   const socks = createSocksProxy({

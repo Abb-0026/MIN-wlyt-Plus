@@ -23,7 +23,7 @@ const { startMockStack } = require('../test-utils/mock-proxy');
     ? { username: 'user', password: 'pass' }
     : null;
 
-  const stack = await startMockStack({ socksAuth });
+  const stack = await startMockStack({ socksAuth, lockups: process.env.MOCK_LOCKUPS === '1' });
 
   // 「外向き通信が本当に止まっているか」を目で見えるようにする
   let total = 0;

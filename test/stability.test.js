@@ -63,8 +63,13 @@ test('metadata fast path is additive: yts fallback still reachable in every hand
     const block = index.slice(index.indexOf(`app.get("${handler}"`));
     const body = block.slice(0, block.indexOf('\napp.get('));
     assert.match(body, /fastMeta\(/, `${handler} に高速経路がある`);
-    assert.match(body, /yts\.GetListByKeyword/, `${handler} の従来経路が残っている`);
+    // 従来経路は legacySearch() に集約した（ブロック環境で無駄に外へ出さないため）
+    assert.match(body, /legacySearch\(/, `${handler} の従来経路が残っている`);
   }
+  // その legacySearch が本当に youtube-search-api を呼ぶこと
+  const helper = index.slice(index.indexOf('async function legacySearch'), index.indexOf('/** id が被らないように足す */'));
+  assert.match(helper, /yts\.GetListByKeyword/, '従来経路は youtube-search-api のまま');
+  assert.match(helper, /normalizeYtsItems/, '従来経路の結果も整形する');
   // コメント継続は従来の API ループも残す
   const comments = index.slice(index.indexOf('app.get("/api/comments/:videoId"'));
   assert.match(comments, /ytMeta\.commentsNext\(/);

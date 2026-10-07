@@ -67,7 +67,13 @@ const reelItem = (id, title) => ({
   },
 });
 
-const lockup = (id, title, rows) => ({
+/**
+ * 実際の lockupViewModel の形。
+ * チャンネル名・再生数・投稿日は1つの metadataRows に metadataParts として並び、
+ * チャンネルアイコンは最初の part の avatar.image.sources に入る。
+ * 動画サムネは contentImage 側（＝アイコンと混ぜないこと）。
+ */
+const lockup = (id, title, parts, { avatar = true } = {}) => ({
   lockupViewModel: {
     contentId: id,
     contentType: 'VIDEO',
@@ -76,15 +82,24 @@ const lockup = (id, title, rows) => ({
         title: { content: title },
         metadata: {
           contentMetadataViewModel: {
-            metadataRows: rows.map((parts) => ({
-              metadataParts: parts.map((t) => ({ text: { content: t } })),
-            })),
+            metadataRows: [{
+              metadataParts: [
+                Object.assign(
+                  { text: { content: parts[0] } },
+                  avatar
+                    ? { avatar: { image: { sources: [{ url: `https://yt3.ggpht.com/ytc/${id}=s88-c-k-c0x00ffffff-no-rj` }] } } }
+                    : {}
+                ),
+                ...parts.slice(1).map((t) => ({ text: { content: t } })),
+              ],
+            }],
           },
         },
       },
     },
     contentImage: {
       thumbnailViewModel: { image: { sources: [{ url: `https://i.ytimg.com/vi/${id}/l.jpg` }] } },
+      thumbnailBadgeViewModel: { thumbnailBadgeViewModel: { text: '10:31' } },
     },
   },
 });
@@ -465,4 +480,95 @@ test('プロキシ不通は即リトライの余地を残す（ネガティブ�
   await blocked.search('same').catch(() => {});
   await blocked.search('same').catch(() => {});
   assert.strictEqual(rejected, 1, '拒否されたリクエストは一定時間再挑戦しない');
+});
+
+test('lockupViewModel: チャンネル名・再生数・投稿日を部品ごとに分けて取り出す', () => {
+  // 行をまとめて join すると "Ch名 1.2万回視聴 3 日前" が1本になってしまう
+  const root = [lockup('ddddddddddd', '新しい動画', ['Ch D', '1.2万回視聴', '3 日前'])];
+  const { items } = extractItems(root);
+  const item = items.find((i) => i.id === 'ddddddddddd');
+  assert.strictEqual(item.channel, 'Ch D');
+  assert.strictEqual(item.views, '1.2万回視聴');
+  assert.strictEqual(item.published, '3 日前');
+  assert.strictEqual(item.duration, '10:31', 'サムネのバッジから再生時間を取る');
+
+  const card = _internal.toCard(item);
+  assert.strictEqual(card.channelTitle, 'Ch D');
+  assert.strictEqual(card.viewCountText, '1.2万回視聴');
+  assert.strictEqual(card.publishedTimeText, '3 日前');
+  assert.strictEqual(card.lengthText, '10:31');
+});
+
+test('lockupViewModel: チャンネルアイコンが取れる（動画サムネと取り違えない）', () => {
+  const root = [lockup('ddddddddddd', 'アイコン付き', ['Ch D', '1,000 回視聴', '1 日前'])];
+  const item = extractItems(root).items.find((i) => i.id === 'ddddddddddd');
+  assert.ok(/yt3\.ggpht\.com/.test(item.avatar), `アイコンURL: ${item.avatar}`);
+  // 動画サムネ（i.ytimg.com）をアイコンにしていない
+  assert.ok(!/i\.ytimg\.com/.test(item.avatar));
+  assert.strictEqual(_internal.toCard(item).channelThumbnail, item.avatar);
+
+  // アイコンが無い場合（metadata に sources が無い）
+  const bare = [lockup('eeeeeeeeeee', 'アイコン無し', ['Ch E'], { avatar: false })];
+  const noAvatar = extractItems(bare).items.find((i) => i.id === 'eeeeeeeeeee');
+  assert.strictEqual(noAvatar.avatar, '');
+  assert.strictEqual(noAvatar.thumb, 'https://i.ytimg.com/vi/eeeeeeeeeee/l.jpg', 'サムネは別に取れる');
+});
+
+test('pickAvatar: アイコン用ホストを優先し、無ければ最初の候補を採る', () => {
+  const { pickAvatar } = _internal;
+  assert.strictEqual(pickAvatar({ avatar: { image: { sources: [{ url: 'https://yt3.ggpht.com/a=s88' }] } } }), 'https://yt3.ggpht.com/a=s88');
+  // アイコン用ホストがある方を優先（動画サムネが混ざっていても）
+  const mixed = { sources: [{ url: 'https://i.ytimg.com/vi/x/hq.jpg' }, { url: 'https://yt3.ggpht.com/av' }] };
+  assert.strictEqual(pickAvatar(mixed), 'https://yt3.ggpht.com/av');
+  // ホストで判定できないときは最初の候補
+  assert.strictEqual(pickAvatar({ sources: [{ url: 'https://example.com/a.png' }] }), 'https://example.com/a.png');
+  assert.strictEqual(pickAvatar(null), '');
+  assert.strictEqual(pickAvatar({}), '');
+});
+
+test('videoRenderer のチャンネルアイコンも取れる', () => {
+  const r = {
+    videoRenderer: {
+      videoId: 'aaaaaaaaaaa',
+      title: { runs: [{ text: 't' }] },
+      channelThumbnailSupportedRenderers: {
+        channelThumbnailWithLinkRenderer: {
+          thumbnail: { thumbnails: [{ url: 'https://yt3.ggpht.com/ch=s48', width: 48 }] },
+        },
+      },
+    },
+  };
+  const item = extractItems([r]).items[0];
+  assert.strictEqual(item.avatar, 'https://yt3.ggpht.com/ch=s48');
+});
+
+test('channel: 旧い channelMetadataRenderer でもアイコンと登録者数を取る', async () => {
+  const fetchImpl = makeFetch(async ({ endpoint, body }) => {
+    if (endpoint !== 'browse') throw new Error('unexpected ' + endpoint);
+    return jsonRes({
+      metadata: {
+        channelMetadataRenderer: {
+          title: '旧形式チャンネル',
+          description: 'せつめい',
+          subscriberCountText: '12.3万人',
+          videoCountText: '345本',
+          avatar: { thumbnails: [{ url: 'https://yt3.ggpht.com/old-avatar=s176', width: 176, height: 176 }] },
+        },
+      },
+      contents: { twoColumnBrowseResultsRenderer: { tabs: [] } },
+    });
+  });
+  const yt = new YtMetadata({ fetchImpl, hedgeMs: 0 });
+
+  const out = await yt.channel('UColdformatxxxxxxxxxxxxxx');
+  assert.strictEqual(out.channelName, '旧形式チャンネル');
+  assert.strictEqual(out.description, 'せつめい');
+  // アイコンが取れないのが「チャンネルアイコンが表示されない」の正体
+  assert.match(out.channelImage, /yt3\.ggpht\.com/);
+  assert.strictEqual(out.subscriberText, '12.3万人');
+  assert.strictEqual(out.videoCountText, '345本');
+  // ストリームではなく browse（メタデータ）だけを叩く
+  const browses = fetchImpl.calls.filter((c) => c.endpoint === 'browse');
+  assert.strictEqual(browses.length, 1, 'browse は1往復');
+  assert.strictEqual(browses[0].body.browseId, 'UColdformatxxxxxxxxxxxxxx');
 });
