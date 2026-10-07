@@ -1,6 +1,7 @@
 'use strict';
 
 const test = require('node:test');
+const { afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { StreamResolver, TIER } = require('../lib/stream-resolver');
 
@@ -21,11 +22,18 @@ const LATENCY = {
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// 「応答しない」を再現するタイマー。プロセスの終了を妨げないよう unref する
-// （unref しないとテスト全体が 100 秒ぶん余計に待たされる）。
+
+// 「応答しない」取得元の再現。放置するとテスト全体が 100 秒ぶん余計に待たされるので、
+// タイマーを記録しておいて各テストの終わりで必ず消す。
+// （unref() は使わない。イベントループが空になってテストが打ち切られるため）
+const hangTimers = new Set();
 const hang = () => new Promise((r) => {
   const t = setTimeout(r, 99999);
-  if (typeof t.unref === 'function') t.unref();
+  hangTimers.add(t);
+});
+afterEach(() => {
+  for (const t of hangTimers) clearTimeout(t);
+  hangTimers.clear();
 });
 const jsonResponse = (body, ms) =>
   sleep(ms).then(() => ({ ok: true, status: 200, json: async () => body }));
