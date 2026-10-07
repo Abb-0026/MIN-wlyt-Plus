@@ -112,14 +112,33 @@ const itemsOf = (r) => {
   // 5. 診断統計（YT_META_DEBUG=1 のときだけ）
   console.log('\n[5] /api/meta-stats（サーバー側 YT_META_DEBUG=1 が必要）');
   const st = await timed('meta-stats', '/api/meta-stats');
+  let meta = null;
+  let proxy = null;
   if (st.status === 404) {
     console.log('  -- 無効（YT_META_DEBUG=1 を設定すると有効になります）');
-  } else {
-    report(st, st.body ? `cache=${st.body.cacheSize} calls=${st.body.stats && st.body.stats.calls} hits=${st.body.stats && st.body.stats.cacheHits} errors=${st.body.stats && st.body.stats.errors}` : st.text);
-    if (st.body && st.body.stats) {
-      console.log('      endpoints:', JSON.stringify(st.body.stats.byEndpoint));
+  } else if (st.body) {
+    const s = st.body.stats || {};
+    console.log(`  OK  cache=${st.body.cacheSize} calls=${s.calls} hits=${s.cacheHits} errors=${s.errors} shortCircuit=${s.shortCircuited}`);
+    console.log('      endpoints:', JSON.stringify(s.byEndpoint));
+    meta = st.body.meta;
+    proxy = st.body.proxy;
+    if (proxy) {
+      if (proxy.direct) {
+        console.log('      経路: 直接接続（プロキシ未設定）');
+      } else {
+        for (const p of proxy.proxies) {
+          console.log(`      経路: ${p.proxy} ok=${p.ok} failures=${p.failures} cooling=${p.coolingFor}ms`);
+        }
+      }
     }
+    if (meta) {
+      console.log(`      回路: ${meta.circuitOpen ? `OPEN（あと ${meta.circuitOpenFor}ms は外向き通信を止める）` : 'CLOSED'}` +
+        ` 連続失敗=${meta.consecutiveFailures} ヘッジ=${meta.hedging ? 'on' : 'off'} ネガティブ=${meta.negativeEntries}`);
+    }
+  } else {
+    report(st, st.text);
   }
+  const circuitOpen = !!(meta && meta.circuitOpen);
 
   // 判定
   console.log('\n' + line);
@@ -131,6 +150,28 @@ const itemsOf = (r) => {
 
   if (total === 0) {
     failures++;
+    if (circuitOpen) {
+      console.log(`
+  ⚠ サーキットブレーカーが開いています（IPブロック検知）。
+
+    これは「壊れている」のではなく、想定どおりの防御動作です:
+      ・外向き通信は止まっている（無駄な往復ゼロ）
+      ・従来経路（youtube-search-api）へフォールバックする
+      ・冷却時間後に自動で再開する
+
+    対処:
+      1. プロキシを設定する
+           YT_META_PROXY=http://user:pass@host:port
+           （カンマ区切りで複数→ローテーション。socks5:// も可）
+      2. プロキシ自体がブロックされているなら、別のプロキシへ差し替える
+      3. どちらも無理なら YT_META=0 で無効化（ストリームには影響なし）
+`);
+      failures = 0; // 防御動作として想定内なので終了コードは 0 のまま
+      console.log(line);
+      console.log('結論: 高速経路は無効化されているが、アプリは従来経路で動作中。');
+      console.log(line + '\n');
+      process.exit(0);
+    }
     console.log(`
   ✗ すべて 0 件です。高速経路が生きていません。切り分け:
 

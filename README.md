@@ -100,6 +100,28 @@ node index.js
 
 すべて**追加**であり、置き換えではありません。高速経路が失敗・0件のときは従来の取得処理へフォールバックします。
 
+### IP ブロックされる環境（プロキシ / サーキットブレーカー）
+
+```bash
+# プロキシ経由で叩く（カンマ区切りで複数 → ローテーション。socks5:// も可）
+YT_META_PROXY=http://user:pass@proxy.example.com:8080
+# youtube-search-api（axios）ごと通したいなら HTTPS_PROXY だけで両方カバーできます
+```
+
+TLS はプロキシを**貫通**します（CONNECT トンネル上で end-to-end）。実装は `lib/proxy-tunnel.js` で、undici などの依存は追加していません。
+
+ブロックされたときは無駄な通信を止めます（`lib/yt-innertube.js`）:
+
+- 連続 3 回失敗で**サーキットブレーカー**が開き、60 秒（最大10分まで倍増）は外向き通信を**ゼロ**に。その間は即座に従来経路へフォールバックするので、待ち時間はほぼゼロ
+- 失敗中は**予備クライアントを並走させない**（往復を 1/3 に）
+- 同じリクエストは 30 秒**ネガティブキャッシュ**して再挑戦を遅らせる
+- 死んだプロキシは一定時間ローテーションから外す（失敗ごとに倍増、最大10分）
+
+実測（`scripts/mock-youtube.js` で「403を返すプロキシ」を相手にした場合）: 外向き CONNECT は**最初の5回で打ち止め**、以降は 0 回。`/api/search` の応答は 10ms 前後です。
+
+- 状態確認: `YT_META_DEBUG=1` で `/api/meta-stats` の `meta.circuitOpen` / `proxy.proxies[].coolingFor` を見る
+- 詳細: [`docs/metadata-verification.md`](docs/metadata-verification.md)
+
 - 無効化: 環境変数 `YT_META=0`
 - デバッグログ: `YT_META_DEBUG=1`（`[yt-meta]` ログと `/api/meta-stats` が有効になる）
 

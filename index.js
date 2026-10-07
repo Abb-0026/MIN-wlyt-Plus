@@ -8,6 +8,7 @@ const https = require("https");
 const fs = require('fs');
 const { StreamResolver, normalizeComments } = require("./lib/stream-resolver");
 const { YtMetadata } = require("./lib/yt-innertube");
+const { createProxiedFetch, proxiesFromEnv } = require("./lib/proxy-tunnel");
 
 let wispServer = null;
 try {
@@ -63,6 +64,8 @@ app.get("/api/meta-stats", (_req, res) => {
     hasVisitorId: !!ytMeta.visitorId,
     cacheSize: ytMeta.cache.size,
     stats: ytMeta.stats,
+    meta: ytMeta.state(),     // サーキットブレーカー / ネガティブキャッシュの状態
+    proxy: ytFetch.status(),  // プロキシの利用状況（認証情報は含めない）
     now: Date.now(),
   });
 });
@@ -101,11 +104,26 @@ const streamResolver = new StreamResolver({ fetchImpl: fetch, timeout: 4000, dea
 
 // --- メタデータ解決（InnerTube 直結の高速経路。失敗時は従来の yts 経路へフォールバック） ---
 // YT_META=0 で無効化できる。ストリームはここを通らない（player エンドポイントは叩かない）。
+//
+// IP ブロックされうる環境では、プロキシ経由で叩ける:
+//   YT_META_PROXY=http://user:pass@host:port          （複数はカンマ区切りでローテーション）
+//   YT_META_PROXY=socks5://user:pass@host:port
+// 未設定なら HTTPS_PROXY / HTTP_PROXY を見る。どちらも無ければ直接接続。
+// youtube-search-api（axios）は HTTPS_PROXY を自動で読むので、環境変数1つで両方カバーできる。
 const YT_META_ENABLED = process.env.YT_META !== "0";
-const ytMeta = new YtMetadata({
+const ytProxies = proxiesFromEnv(process.env);
+const ytFetch = createProxiedFetch({
+  proxies: ytProxies,
   fetchImpl: fetch,
+  tunnelTimeout: 10000,
+  // ローカル検証用。本番では触らないこと（証明書検証を無効にする）。
+  rejectUnauthorized: process.env.YT_META_TLS_REJECT !== "0",
+});
+const ytMeta = new YtMetadata({
+  fetchImpl: ytFetch,
   timeout: 6000,
   hedgeMs: 400,
+  host: process.env.YT_META_HOST || "https://www.youtube.com",
   logger: (msg, extra) => {
     if (process.env.YT_META_DEBUG === "1") console.log(msg, extra || "");
   },
