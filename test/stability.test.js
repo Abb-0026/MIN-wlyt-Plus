@@ -52,6 +52,81 @@ test('manifest, service worker, and icons map to files that exist', () => {
   }
 });
 
+test('metadata fast path never touches the player endpoint (streams stay API-dependent)', () => {
+  const yt = read('lib/yt-innertube.js');
+  assert.doesNotMatch(yt, /['"`]player['"`]/, 'player エンドポイントは使わない');
+  assert.doesNotMatch(yt, /streamingData|formats\[|adaptiveFormats/, 'ストリーム解析を含めない');
+});
+
+test('metadata fast path is additive: yts fallback still reachable in every handler', () => {
+  for (const handler of ['/api/search', '/api/trending', '/api/recommendations']) {
+    const block = index.slice(index.indexOf(`app.get("${handler}"`));
+    const body = block.slice(0, block.indexOf('\napp.get('));
+    assert.match(body, /fastMeta\(/, `${handler} に高速経路がある`);
+    // 従来経路は legacySearch() に集約した（ブロック環境で無駄に外へ出さないため）
+    assert.match(body, /legacySearch\(/, `${handler} の従来経路が残っている`);
+  }
+  // その legacySearch が本当に youtube-search-api を呼ぶこと
+  const helper = index.slice(index.indexOf('async function legacySearch'), index.indexOf('/** id が被らないように足す */'));
+  assert.match(helper, /yts\.GetListByKeyword/, '従来経路は youtube-search-api のまま');
+  assert.match(helper, /normalizeYtsItems/, '従来経路の結果も整形する');
+  // コメント継続は従来の API ループも残す
+  const comments = index.slice(index.indexOf('app.get("/api/comments/:videoId"'));
+  assert.match(comments, /ytMeta\.commentsNext\(/);
+  assert.match(comments, /apiListCache/);
+});
+
+test('home.html escapes external metadata before injecting it into innerHTML', () => {
+  const home = read('public/home.html');
+  assert.match(home, /function esc\(s\)/);
+  assert.match(home, /function safeUrl\(url\)/);
+  // 生の item.title / channelTitle を innerHTML へ直接埋めない
+  assert.doesNotMatch(home, /\$\{item\.title[^}]*\}[^}]*<h3>/);
+  for (const raw of ['${item.title}', '${item.channelTitle}', '${item.viewCountText}', '${item.lengthText}']) {
+    assert.equal(home.split(raw).length - 1, 0, `${raw} は必ず esc() を通す`);
+  }
+  // アバター URL は常に safeUrl() を通る（カード描画は createVideoCard() に1本化した）
+  const avatars = home.match(/const avatarUrl = .*/g) || [];
+  assert.equal(avatars.length, 1, 'カード描画は1か所だけ');
+  for (const line of avatars) assert.match(line, /safeUrl\(/);
+});
+
+test('metadata diagnostics stay closed unless debug mode is on', () => {
+  const block = index.slice(index.indexOf('app.get("/api/meta-stats"'));
+  const body = block.slice(0, block.indexOf('\napp.get('));
+  assert.match(body, /YT_META_DEBUG\s*!==\s*"1"\s*\)\s*return\s+res\.status\(404\)/);
+  assert.doesNotMatch(body, /visitorId:/, 'visitorId そのものは返さない（真偽値のみ）');
+  assert.match(body, /hasVisitorId:\s*!!ytMeta\.visitorId/);
+});
+
+test('verification script and docs ship with the fast path', () => {
+  const script = read('scripts/verify-meta.js');
+  assert.match(script, /\/api\/meta-stats/);
+  assert.match(script, /\/api\/recommendations/);
+  assert.match(script, /process\.exit\(failures \? 1 : 0\)/);
+  const docs = read('docs/metadata-verification.md');
+  assert.match(docs, /YT_META=0/);
+  assert.match(docs, /scripts\/verify-meta\.js/);
+});
+
+test('proxy handling stays opt-out and keeps the manual override', () => {
+  const block = index.slice(index.indexOf('const YT_META_ENABLED'));
+  const body = block.slice(0, block.indexOf('// --- ストリーム解決'));
+  assert.match(body, /YT_META_PROXY/);
+  assert.match(body, /YT_META_PROXY_AUTO/, '自動取得の停止スイッチがある');
+  assert.match(body, /ProxyHarvester/, '自動取得が配線されている');
+  assert.match(body, /manualProxies\.length \? manualProxies/, '手動指定が最優先');
+  // 自動取得は既定の公開リストを持ち、起動をブロックしない
+  const sources = read('lib/proxy-sources.js');
+  assert.match(sources, /DEFAULT_SOURCES\s*=/);
+  assert.match(sources, /start\(\)[\s\S]{0,400}this\.refresh\(\)\.catch/);
+  const tunnel = read('lib/proxy-tunnel.js');
+  // 依存を増やさない（コメントで言及しているだけなので require の形で見る）
+  assert.doesNotMatch(tunnel, /require\(['"]undici['"]\)/);
+  assert.doesNotMatch(tunnel, /require\(['"]https-proxy-agent['"]\)/);
+  assert.doesNotMatch(tunnel, /require\(['"]socks-proxy-agent['"]\)/);
+});
+
 test('service worker only precaches valid app-shell paths', () => {
   const match = serviceWorker.match(/const PRECACHE = (\[[\s\S]*?\]);/);
   assert.ok(match, 'PRECACHE list should be present');

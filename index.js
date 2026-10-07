@@ -6,6 +6,11 @@ const fetch = require("node-fetch");
 const cookieParser = require("cookie-parser");
 const https = require("https");
 const fs = require('fs');
+const { StreamResolver, normalizeComments } = require("./lib/stream-resolver");
+const { YtMetadata, textOf } = require("./lib/yt-innertube");
+const { buildSearchParams, filtersFromQuery } = require("./lib/search-filters");
+const { createProxiedFetch, proxiesFromEnv, parseProxyList } = require("./lib/proxy-tunnel");
+const { ProxyHarvester } = require("./lib/proxy-sources");
 
 let wispServer = null;
 try {
@@ -21,8 +26,10 @@ const port = process.env.PORT || 3000;
 app.set("views", path.join(__dirname, "views"));
 app.set("view engine", "ejs");
 
-const API_HEALTH_CHECKER = "https://raw.githubusercontent.com/Minotaur-ZAOU/test/refs/heads/main/min-tube-api.json";
-const TEMP_API_LIST = "https://raw.githubusercontent.com/Minotaur-ZAOU/test/refs/heads/main/min-tube-api.json";
+// 上流（Min-Tube API）の一覧URL。セルフホスト時やテスト時は MIN_TUBE_API_LIST で差し替えられる。
+const API_HEALTH_CHECKER = process.env.MIN_TUBE_API_LIST
+  || "https://raw.githubusercontent.com/Minotaur-ZAOU/test/refs/heads/main/min-tube-api.json";
+const TEMP_API_LIST = API_HEALTH_CHECKER;
 const RAPID_API_HOST = 'ytstream-download-youtube-videos.p.rapidapi.com';
 const videoCache = new Map();
 const userAgents = [
@@ -48,6 +55,225 @@ app.use(cookieParser());
 // Lightweight endpoint for hosting-platform health checks; it does not depend on upstream APIs.
 app.get("/healthz", (_req, res) => {
   res.status(200).json({ status: "ok" });
+});
+
+/**
+ * アイコンが無いチャンネル用のプレースホルダ（頭文字＋安定した色）。
+ *
+ * 以前は ui-avatars.com を直に叩いていたが、IPブロック環境やそのサービス側の障害で
+ * 画像が落ちると onerror で消え、「チャンネルアイコンが表示されない」状態になっていた。
+ * 自前で返せば外部に依存しない。
+ */
+const AVATAR_COLORS = ['#ff0000', '#ff6d00', '#ffd600', '#00c853', '#00b0ff', '#651fff', '#d500f9', '#f50057'];
+
+function avatarInitial(name) {
+  const ch = String(name || '').trim();
+  if (!ch) return '?';
+  // 絵文字などを壊さないよう codePointAt で1文字取る
+  return String.fromCodePoint(ch.codePointAt(0)).toUpperCase();
+}
+
+function avatarColor(name) {
+  const str = String(name || '');
+  let sum = 0;
+  for (const ch of str) sum = (sum + ch.codePointAt(0)) % 2147483647;
+  return AVATAR_COLORS[sum % AVATAR_COLORS.length];
+}
+
+app.get("/api/avatar", (req, res) => {
+  const name = String(req.query.name || '').trim().slice(0, 64);
+  const known = knownAvatar(name);
+  if (known && /^https?:\/\//i.test(known)) {
+    // 実アイコンを覚えている場合はそこへ飛ばす（CORS/Referer 対策の referrerPolicy はフロント側）
+    return res.redirect(302, known);
+  }
+  const initial = avatarInitial(name || '?');
+  const bg = avatarColor(name || '?');
+  // 頭文字は利用者入力由来なので XML として必ず逃がす（SVG はスクリプトを実行できる）
+  const safeInitial = initial.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="${safeInitial}">`
+    + `<rect width="64" height="64" rx="32" fill="${bg}"/>`
+    + `<text x="32" y="41" text-anchor="middle" font-family="Roboto,Arial,sans-serif" font-size="30" font-weight="500" fill="#ffffff">${safeInitial}</text>`
+    + `</svg>`;
+  res.set({
+    'Content-Type': 'image/svg+xml; charset=utf-8',
+    'Cache-Control': 'public, max-age=86400',
+  });
+  res.end(svg);
+});
+
+/* --------------------------------------------------- 従来経路の扱い */
+/**
+ * 従来経路（youtube-search-api）は www.youtube.com に直に取りに行く。
+ * IPブロック環境では毎回数秒ハングして終わるので、
+ *   1. 一度失敗したらしばらく使わない（無駄な外向き通信を止める）
+ *   2. YouTube 本体に拒否されている最中はそもそも試さない
+ *   3. いつまでも待たせない（時間で切る）
+ * この3つで「0件になるまでの時間」を短くする。
+ */
+const LEGACY_COOLDOWN = 5 * 60 * 1000;
+// 待たせすぎない（ホームが0件のまま固まるので）。短くしたいときは環境変数で。
+const LEGACY_TIMEOUT = Math.max(300, parseInt(process.env.YT_LEGACY_TIMEOUT, 10) || 4000);
+let legacyDeadUntil = 0;
+
+function legacyIsDead() {
+  return Date.now() < legacyDeadUntil;
+}
+
+function legacyDisabled() {
+  return legacyIsDead() || !!(YT_META_ENABLED && ytMeta && ytMeta.isBlocked);
+}
+
+/** 従来経路で検索する。使えない/失敗なら空配列（落ちない）。 */
+async function legacySearch(q, limit = 20, page = 0) {
+  if (legacyDisabled()) return [];
+  let timer;
+  try {
+    const results = await Promise.race([
+      yts.GetListByKeyword(q, false, limit, page),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('legacy timeout')), LEGACY_TIMEOUT);
+      }),
+    ]);
+    return normalizeYtsItems(results && results.items);
+  } catch (err) {
+    legacyDeadUntil = Date.now() + LEGACY_COOLDOWN;
+    if (process.env.YT_META_DEBUG) console.warn('[legacy] dead for a while:', err && err.message);
+    return [];
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** id が被らないように足す */
+function mergeItems(base, extra, limit = 60) {
+  const seen = new Set();
+  const out = [];
+  for (const item of [...(base || []), ...(extra || [])]) {
+    if (!item || !item.id) continue;
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    out.push(item);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------ 検索候補 */
+/**
+ * 検索候補（サジェスト）
+ *
+ * 以前はブラウザが suggestqueries.google.com へ JSONP で直に取りに行っていたが、
+ * IPブロック環境ではそれも落ちて候補が一切出なかった。
+ * サーバ側に移して:
+ *   1. プロキシが使えればプロキシ経由で取りに行く
+ *   2. 結果はしばらくキャッシュする（同じ入力で毎回外に出ない）
+ *   3. 取れなくても 500 にせず空を返す（フロントは履歴で代替する）
+ */
+const SUGGEST_ENDPOINTS = (process.env.YT_SUGGEST_URLS || 'https://suggestqueries.google.com/complete/search,https://suggestqueries-clients6.youtube.com/complete/search')
+  .split(',').map((u) => u.trim()).filter(Boolean);
+const SUGGEST_TTL = 10 * 60 * 1000;
+const SUGGEST_MAX = 200;
+const suggestCache = new Map();
+
+function suggestCached(q) {
+  const hit = suggestCache.get(q);
+  if (!hit) return null;
+  if (Date.now() - hit.at > SUGGEST_TTL) {
+    suggestCache.delete(q);
+    return null;
+  }
+  return hit.items;
+}
+
+/** 候補のJSONP/JSONをほどく（"window.google..." 形式にも一応対応） */
+function parseSuggestBody(text) {
+  let str = String(text || '').trim();
+  if (!str) return [];
+  const open = str.indexOf('(');
+  if (open > 0 && str.endsWith(')')) {
+    // google.suggest({...}) のようなラップを外す
+    const head = str.slice(0, open).trim();
+    if (head && !head.startsWith('[') && !head.startsWith('{')) {
+      str = str.slice(open + 1, -1).trim();
+    }
+  }
+  const data = JSON.parse(str);
+  const raw = Array.isArray(data) && Array.isArray(data[1]) ? data[1] : [];
+  const out = [];
+  for (const entry of raw) {
+    // [ "曲名", 0 ] または [ "曲名", 0, [ [タイプ, 0], ... ] ]
+    const term = Array.isArray(entry) ? entry[0] : entry;
+    if (typeof term === 'string' && term.trim()) out.push(term.trim().slice(0, 120));
+  }
+  return out.slice(0, 12);
+}
+
+async function fetchSuggest(q) {
+  const cached = suggestCached(q);
+  if (cached) return { items: cached, source: 'cache' };
+
+  // メタデータ経路の fetch は（設定されていれば）プロキシを通るので使い回す
+  const fetchImpl = (YT_META_ENABLED && ytMeta && typeof ytMeta.fetchImpl === 'function')
+    ? ytMeta.fetchImpl
+    : fetch;
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), 2500) : null;
+
+  try {
+    for (const base of SUGGEST_ENDPOINTS) {
+      const url = `${base}?client=youtube&ds=yt&hl=ja&q=${encodeURIComponent(q)}`;
+      try {
+        const res = await fetchImpl(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0', Accept: '*/*' },
+          signal: controller ? controller.signal : undefined,
+        });
+        if (!res || !res.ok) continue;
+        const items = parseSuggestBody(await res.text());
+        if (items.length) {
+          if (suggestCache.size >= SUGGEST_MAX) {
+            suggestCache.delete(suggestCache.keys().next().value); // 古いものから捨てる
+          }
+          suggestCache.set(q, { items, at: Date.now() });
+          return { items, source: 'remote' };
+        }
+      } catch (e) {
+        if (process.env.YT_META_DEBUG) console.warn('[suggest]', base, e && e.message);
+      }
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return { items: [], source: 'none' };
+}
+
+app.get("/api/suggest", async (req, res) => {
+  const q = String(req.query.q || '').trim().slice(0, 100);
+  if (!q) return res.json({ query: '', items: [], source: 'none' });
+  try {
+    const out = await fetchSuggest(q);
+    res.json({ query: q, ...out });
+  } catch (err) {
+    // 候補が取れなくても検索自体はできるので、空で返す
+    res.json({ query: q, items: [], source: 'none' });
+  }
+});
+
+// メタデータ高速経路の診断用。実機検証のときだけ YT_META_DEBUG=1 で有効にする。
+// 既定では 404（外部にキャッシュの中身や visitorId を見せない）。
+app.get("/api/meta-stats", (_req, res) => {
+  if (process.env.YT_META_DEBUG !== "1") return res.status(404).json({ error: "not found" });
+  res.json({
+    enabled: YT_META_ENABLED,
+    hasVisitorId: !!ytMeta.visitorId,
+    cacheSize: ytMeta.cache.size,
+    stats: ytMeta.stats,
+    meta: ytMeta.state(),     // サーキットブレーカー / ネガティブキャッシュの状態
+    proxy: ytFetch.status(),  // プロキシの利用状況（認証情報は含めない）
+    proxySources: proxyHarvester ? proxyHarvester.status() : { enabled: false, reason: 'YT_META_PROXY が手動設定されている' },
+    now: Date.now(),
+  });
 });
 
 let apiListCache = [];
@@ -79,6 +305,183 @@ function fetchWithTimeout(url, options = {}, timeout = 5000) {
   ]);
 }
 
+// --- ストリーム解決（全取得元を並列レース + メモリキャッシュ） ---
+const streamResolver = new StreamResolver({ fetchImpl: fetch, timeout: 4000, deadline: 6000 });
+
+// --- メタデータ解決（InnerTube 直結の高速経路。失敗時は従来の yts 経路へフォールバック） ---
+// YT_META=0 で無効化できる。ストリームはここを通らない（player エンドポイントは叩かない）。
+//
+// IP ブロックされうる環境では、プロキシ経由で叩ける。優先順位:
+//   1. YT_META_PROXY=http://user:pass@host:port  … 手動指定（カンマ区切りで複数、socks5:// も可）
+//   2. 無料プロキシリストの自動取得            … 既定で有効（YT_META_PROXY_AUTO=0 で止める）
+//   3. HTTPS_PROXY / HTTP_PROXY                 … 自動取得を止めたときのフォールバック
+// どれも無ければ直接接続。
+//
+// 自動取得は「裏でリストを取りに行き、取れた分から使う」ので起動をブロックしない。
+// 1回も取れなければ直接接続のまま（＝今までどおり）なので、壊れても従来経路で動く。
+const YT_META_ENABLED = process.env.YT_META !== "0";
+const manualProxies = process.env.YT_META_PROXY ? parseProxyList(process.env.YT_META_PROXY) : [];
+const autoProxy = !manualProxies.length && process.env.YT_META_PROXY_AUTO !== "0";
+const ytProxies = manualProxies.length ? manualProxies : (autoProxy ? [] : proxiesFromEnv(process.env));
+const ytFetch = createProxiedFetch({
+  proxies: ytProxies,
+  fetchImpl: fetch,
+  tunnelTimeout: 10000,
+  // ローカル検証用。本番では触らないこと（証明書検証を無効にする）。
+  rejectUnauthorized: process.env.YT_META_TLS_REJECT !== "0",
+});
+const ytMeta = new YtMetadata({
+  fetchImpl: ytFetch,
+  timeout: 6000,
+  hedgeMs: 400,
+  host: process.env.YT_META_HOST || "https://www.youtube.com",
+  logger: (msg, extra) => {
+    if (process.env.YT_META_DEBUG === "1") console.log(msg, extra || "");
+  },
+});
+
+// 無料プロキシリストの自動取得（YT_META_PROXY を手で設定したときは動かない）
+const proxyHarvester = autoProxy
+  ? new ProxyHarvester({
+    pool: ytFetch.pool,
+    fetchImpl: fetch,
+    sources: process.env.YT_META_PROXY_SOURCES,
+    // ローカルのモック検証用（127.0.0.1 のプロキシを許可する）。本番では使わない。
+    allowPrivate: process.env.YT_META_PROXY_ALLOW_PRIVATE === "1",
+    logger: (msg, extra) => {
+      if (process.env.YT_META_DEBUG === "1") console.log(msg, extra || "");
+    },
+  })
+  : null;
+
+if (YT_META_ENABLED) {
+  proxyHarvester?.start(); // 裏でリストを取りに行く（起動は待たない）
+  // 起動時に裏で visitorData とトレンドを温める（初回の1往復を隠す）。
+  // 取れたアイコンもここで覚えておくと、後でブロックされても使い回せる。
+  ytMeta.warmup().then((r) => rememberAvatars(r && r.trending ? r.trending.items : null)).catch(() => {});
+  const sweepTimer = setInterval(() => ytMeta.sweep(), 300000);
+  if (typeof sweepTimer.unref === 'function') sweepTimer.unref();
+}
+
+/** 表示順を毎回シャッフルする（Fisher-Yates） */
+function shuffle(list) {
+  const arr = list.slice();
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+/**
+ * youtube-search-api の結果を home.html が期待する形に整える。
+ *
+ * youtube-search-api は { id, type, thumbnail, title, channelTitle,
+ * shortBylineText, length, isLive } しか返さない。
+ * つまり viewCountText / publishedTimeText / channelThumbnail は常に無く、
+ * length も文字列ではなく {simpleText} のオブジェクト。
+ * home.html は YouTube 形式のフィールド名を見るので、ここで揃えておかないと
+ * 「再生数・投稿日・再生時間・チャンネルアイコン」が全部消える。
+ */
+/* ------------------------------------------------------------------ アイコン */
+/**
+ * チャンネル名 → アイコンURL の小さな記憶域。
+ *
+ * InnerTube が通ったときに覚えておき、ブロックされて従来経路に落ちたときでも
+ * 同じチャンネルのアイコンを出せるようにする（外部サービスへの依存を増やさない）。
+ */
+const AVATAR_TTL = 7 * 24 * 60 * 60 * 1000;
+const avatarCache = new Map(); // name(小文字) -> { url, at }
+
+function rememberAvatars(items) {
+  for (const it of items || []) {
+    const name = String(it.channelTitle || it.channel || it.author || '').trim();
+    const url = it.channelThumbnail || it.channelImage || it.avatar;
+    if (!name || !url) continue;
+    avatarCache.set(name.toLowerCase(), { url, at: Date.now() });
+  }
+}
+
+/** 取れなかった分は、以前に取れたアイコンで埋める（同じチャンネルならまず同じ画像） */
+function fillAvatars(items) {
+  for (const it of items || []) {
+    if (!it || it.channelThumbnail) continue;
+    const known = knownAvatar(it.channelTitle || it.channel || '');
+    if (known) it.channelThumbnail = known;
+  }
+  return items;
+}
+
+function knownAvatar(name) {
+  const hit = avatarCache.get(String(name || '').trim().toLowerCase());
+  if (!hit) return '';
+  if (Date.now() - hit.at > AVATAR_TTL) {
+    avatarCache.delete(String(name || '').trim().toLowerCase());
+    return '';
+  }
+  return hit.url;
+}
+
+function normalizeYtsItems(items) {
+  return (items || [])
+    .map((item) => {
+      if (!item || !item.id || item.type === 'channel' || item.type === 'playlist') return null;
+      return {
+        ...item,
+        type: 'video',
+        lengthText: typeof item.lengthText === 'string'
+          ? item.lengthText
+          : textOf(item.lengthText != null ? item.lengthText : item.length),
+        channelTitle: item.channelTitle || textOf(item.shortBylineText) || '',
+        viewCountText: item.viewCountText || '',
+        publishedTimeText: item.publishedTimeText || '',
+        // 以前に InnerTube で取れたアイコンがあれば使い回す
+        channelThumbnail: item.channelThumbnail || knownAvatar(item.channelTitle || textOf(item.shortBylineText) || ''),
+      };
+    })
+    .filter(Boolean);
+}
+
+/**
+ * 高速経路を試し、空振り（失敗・0件）なら従来の取得処理を実行する。
+ * 「追加」なので、どちらも失敗したときの振る舞いは今までどおり。
+ */
+async function fastMeta(name, attempt, fallback, { timeout = 3500 } = {}) {
+  if (!YT_META_ENABLED) return fallback();
+  let timer;
+  const budget = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${name} fast-path timeout`)), timeout);
+  });
+  const job = attempt();
+  job.catch(() => {}); // 予算超過で負けた分の unhandled rejection を握りつぶす
+  try {
+    const out = await Promise.race([job, budget]);
+    if (out && (!Array.isArray(out.items) || out.items.length > 0)) {
+      rememberAvatars(out.items || (out.video ? [out.video] : []));
+      fillAvatars(out.items);
+      return out;
+    }
+    throw new Error(`${name} fast-path empty`);
+  } catch (err) {
+    console.warn(`[yt-meta] ${name} fallback:`, err && err.message);
+    return fallback();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 動的レスポンス（HTML/JSON）は Service Worker にもブラウザにもキャッシュさせない。
+// キャッシュされると「動画ページに遷移できない / 古いストリームURLで再生できない」不具合になる。
+// ただしプロキシのフロントエンドは静的アセットなので、従来どおりキャッシュさせる。
+const STATIC_PREFIX = /^\/(?:proxy|uv|prxy)(?:\/|$)/;
+app.use((req, res, next) => {
+  if (!STATIC_PREFIX.test(req.path)) {
+    res.setHeader('Cache-Control', 'no-store, must-revalidate');
+    res.setHeader('Vary', 'Cookie');
+  }
+  next();
+});
+
 setInterval(() => {
     const now = Date.now();
     for (const [videoId, cachedItem] of videoCache.entries()) {
@@ -86,11 +489,13 @@ setInterval(() => {
             videoCache.delete(videoId);
         }
     }
+    streamResolver.sweep();
 }, 300000);
 
-// ミドルウェア: 人間確認,
+// ミドルウェア: 人間確認
+// /video/* と /api/* は対象外。ここをガードすると動画ページ遷移が認証画面で詰むため。
 app.use(async (req, res, next) => {
-  if (req.path.startsWith("/api") || req.path.startsWith("/video") || req.path === "/") {
+  if (req.path === "/") {
     if (!req.cookies || req.cookies.humanVerified !== "true") {
       const pages = [
         'https://raw.githubusercontent.com/woolisbest-honke/min-wlyt-plus/refs/heads/main/assist/memo/min-tube-pro-main-loading.txt',
@@ -120,13 +525,30 @@ app.use(async (req, res, next) => {
 
 // --- API ENDPOINTS ---
 
-app.get("/", (req, res) => {
+const serveHome = (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "home.html"));
-});
+};
+
+app.get("/", serveHome);
+// 検索時は /search?q=...&sort=... をURLに入れる（絞り込みを残すため）。
+// 再読み込みやリンク共有で開かれても 404 にならないように、同じページを返す。
+// 条件の読み戻しは home.html の filtersFromUrl() がやる。
+app.get("/search", serveHome);
 
 app.get("/api/trending", async (req, res) => {
   const page = parseInt(req.query.page) || 0;
   try {
+    // 高速経路: browse 1往復（キャッシュ済みなら0往復）
+    const fast = await fastMeta(
+      "trending",
+      async () => {
+        const out = await ytMeta.trending({ page });
+        return out && out.items && out.items.length ? { items: shuffle(out.items) } : null;
+      },
+      () => null
+    );
+    if (fast && fast.items && fast.items.length) return res.json(fast);
+
     const trendingSeeds = [
       "人気急上昇", "最新 ニュース", "Music Video Official", 
       "ゲーム実況 人気", "話題の動画", "トレンド", 
@@ -136,22 +558,26 @@ app.get("/api/trending", async (req, res) => {
     const seed1 = trendingSeeds[(page * 2) % trendingSeeds.length];
     const seed2 = trendingSeeds[(page * 2 + 1) % trendingSeeds.length];
 
-    const [res1, res2] = await Promise.all([
-      yts.GetListByKeyword(seed1, false, 25),
-      yts.GetListByKeyword(seed2, false, 25)
+    // ブロック環境では従来経路は毎回ハングして終わるので、使えないときは呼ばない
+    const [legacy1, legacy2] = await Promise.all([
+      legacySearch(seed1, 25),
+      legacySearch(seed2, 25),
     ]);
+    // 従来経路のitemは home.html が見るフィールド名を持っていないので揃える
+    const normalized = [...legacy1, ...legacy2];
 
-    let combined = [...(res1.items || []), ...(res2.items || [])];
+    // youtube-search-api は viewCountText を返さないので、
+    // それを条件にすると1件も残らない（＝ホームが常に空になる）。id の重複排除だけにする。
+    const combined = normalized;
     const finalItems = [];
     const seenIdsServer = new Set();
 
     for (const item of combined) {
-      if (item.type === 'video' && !seenIdsServer.has(item.id)) {
-        if (item.viewCountText) {
-          seenIdsServer.add(item.id);
-          finalItems.push(item);
-        }
-      }
+      if (!item || !item.id) continue;
+      if (item.type !== 'video') continue;
+      if (seenIdsServer.has(item.id)) continue;
+      seenIdsServer.add(item.id);
+      finalItems.push(item);
     }
 
     const result = finalItems.sort(() => 0.5 - Math.random());
@@ -166,18 +592,97 @@ app.get("/api/trending", async (req, res) => {
 
 app.get("/api/search", async (req, res, next) => {
   const query = req.query.q;
-  const page = req.query.page || 0;
+  const page = parseInt(req.query.page) || 0;
   if (!query) return res.status(400).json({ error: "Query required" });
+
+  // 絞り込み（期間・長さ・種類・並び順）→ InnerTube の sp
+  const filters = filtersFromQuery(req.query);
+  const sp = buildSearchParams(filters);
+  const wanted = !!(filters.uploadDate || filters.type || filters.duration || filters.sort !== "relevance");
+
   try {
-    const results = await yts.GetListByKeyword(query, false, 20, page);
-    res.json(results);
-  } catch (err) { next(err); }
+    // 高速経路: search 1往復（キャッシュ済みなら0往復）。従来は公開ページのスクレイピング。
+    const fast = await fastMeta(
+      "search",
+      () => ytMeta.search(query, { page, sp: sp || undefined }),
+      () => null
+    );
+    const MIN_ITEMS = 8;
+    const reply = (items, extra = {}) =>
+      res.json({ items, filters, filterApplied: !!sp, ...extra });
+
+    let items = (fast && fast.items) || [];
+    let source = items.length ? "innertube" : "none";
+
+    // 絞り込みで0件なら、絞り込みなしでもう一度だけ試す。
+    // sp の値が YouTube 側で変わっても「何も出ない」よりはマシ。
+    if (!items.length && wanted && sp) {
+      const plain = await fastMeta(
+        "search",
+        () => ytMeta.search(query, { page }),
+        () => null
+      );
+      if (plain && plain.items && plain.items.length) {
+        return reply(plain.items, {
+          source: "innertube",
+          filterApplied: false,
+          filterNote: "絞り込みを外して再検索しました",
+        });
+      }
+    }
+
+    // プロキシが死んでいただけ（YouTube本体には拒否されていない）なら、
+    // プールが次のプロキシに回るので一度だけ再挑戦する。
+    if (!items.length && YT_META_ENABLED && ytMeta && !ytMeta.isBlocked && ytMeta.state().transportFailures > 0) {
+      const retry = await fastMeta(
+        "search",
+        () => ytMeta.search(query, { page, sp: sp || undefined }),
+        () => null
+      );
+      if (retry && retry.items && retry.items.length) {
+        items = retry.items;
+        source = "innertube-retry";
+      }
+    }
+
+    // それでも少なければ従来経路で補う（ブロック環境では呼ばれない）。
+    // 従来経路は絞り込みに対応していないので、その旨を返す（UIで告知するため）。
+    if (items.length < MIN_ITEMS) {
+      const extra = await legacySearch(query, 20, page);
+      if (extra.length) {
+        const merged = mergeItems(items, extra);
+        source = items.length ? "mixed" : "legacy";
+        items = merged;
+      }
+    }
+
+    return reply(items, { source, filterApplied: !!sp && source !== "legacy" });
+  } catch (err) {
+    // 取得元が全滅しても 500 の HTML を返さない（UI が静止するので 0 件で返す）
+    console.error("Search API Error:", err && err.message);
+    res.json({ items: [], filters, filterApplied: false, source: "error" });
+  }
 });
 
 
 app.get("/api/recommendations", async (req, res) => {
   const { title, channel, id } = req.query;
   try {
+    // 高速経路: next 1往復で「この動画の関連動画」をそのまま取る。
+    // 従来は yts に3往復（トピック/チャンネル/関連）していた。
+    if (id) {
+      const fast = await fastMeta(
+        "recommendations",
+        async () => {
+          const meta = await ytMeta.videoMeta(String(id));
+          const items = (meta.related || []).filter((it) => it && it.id && it.id !== id);
+          return items.length ? { items: shuffle(items) } : null;
+        },
+        () => null
+      );
+      if (fast && fast.items && fast.items.length) return res.json(fast);
+    }
+
     const cleanKwd = title
       .replace(/[【】「」()!！?？\[\]]/g, ' ')
       .replace(/\s+/g, ' ')
@@ -186,17 +691,14 @@ app.get("/api/recommendations", async (req, res) => {
     const words = cleanKwd.split(' ').filter(w => w.length >= 2);
     const mainTopic = words.length > 0 ? words.slice(0, 2).join(' ') : cleanKwd;
 
+    // ブロック環境では従来経路は毎回ハングして終わるので、使えないときは呼ばない
     const [topicRes, channelRes, relatedRes] = await Promise.all([
-      yts.GetListByKeyword(`${mainTopic}`, false, 12),
-      yts.GetListByKeyword(`${channel}`, false, 8),
-      yts.GetListByKeyword(`${mainTopic} 関連`, false, 8)
+      legacySearch(`${mainTopic}`, 12),
+      legacySearch(`${channel}`, 8),
+      legacySearch(`${mainTopic} 関連`, 8)
     ]);
 
-    let rawList = [
-      ...(topicRes.items || []),
-      ...(channelRes.items || []),
-      ...(relatedRes.items || [])
-    ];
+    const rawList = [...topicRes, ...channelRes, ...relatedRes];
 
     const seenIds = new Set([id]); 
     const seenNormalizedTitles = new Set();
@@ -229,78 +731,145 @@ app.get("/api/recommendations", async (req, res) => {
   }
 });
 
+const escapeAttr = (value) =>
+  String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+const escapeHtml = (value) =>
+  String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+// HTML 中の <script> に文字列を埋め込むためのヘルパー。
+// JSON.stringify だけでは < が残り、</script> でタグが壊れてしまう。
+const jsString = (value) =>
+  JSON.stringify(value == null ? "" : String(value))
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+
+const videoHtml = (url, videoId) =>
+  `<video id="mainPlayer" controls autoplay playsinline preload="auto" poster="https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg" style="width:100%; height:100%; position:relative; z-index:10; background:#000;"><source src="${escapeAttr(url)}" type="video/mp4"></video>`;
+
+const iframeHtml = (url) =>
+  `<iframe id="mainIframe" src="${escapeAttr(url)}" frameborder="0" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen style="width:100%; height:100%; position:relative; z-index:10;"></iframe>`;
+
+const isEmbedUrl = (url) => typeof url === "string" && url.includes("embed");
+
+/**
+ * 動画サーバー（再生モード）ごとの URL を引く。
+ * 取得できなかった場合は null を返し、呼び出し側で googlevideo にフォールバックする。
+ */
+async function resolveModeUrl(mode, videoId, baseUrl) {
+  switch (mode) {
+    case "DL-Pro":
+      try {
+        return { url: await streamResolver.getLateUrl(videoId), type: "video" };
+      } catch (e) {
+        return null;
+      }
+    case "YoutubeEdu-Kahoot":
+      try {
+        const res = await fetchWithTimeout("https://raw.githubusercontent.com/wista-api-project/auto/refs/heads/main/edu/3.txt", {}, 2500);
+        if (!res.ok) return null;
+        const params = (await res.text()).trim();
+        return { url: `https://www.youtubeeducation.com/embed/${videoId}${params}`, type: "iframe" };
+      } catch (e) {
+        return null;
+      }
+    case "YoutubeEdu-Scratch":
+      try {
+        const res = await fetchWithTimeout("https://raw.githubusercontent.com/wista-api-project/auto/refs/heads/main/edu/2.txt", {}, 2500);
+        if (!res.ok) return null;
+        const config = await res.json();
+        return { url: `https://www.youtubeeducation.com/embed/${videoId}${config.params}`, type: "iframe" };
+      } catch (e) {
+        return null;
+      }
+    case "youtube-nocookie":
+      return { url: `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1`, type: "iframe" };
+    case "Youtube-Pro":
+      return { url: `${baseUrl}/pro-stream/${videoId}`, type: "iframe" };
+    case "Elixir-Network":
+      return { url: `${baseUrl}/proxy/embed.html#https://www.youtube-nocookie.com/embed/${videoId}`, type: "iframe" };
+    default:
+      return null;
+  }
+}
+
+/**
+ * プレイヤー HTML をサーバー側で組み立てる（旧・最速バージョンの復元）。
+ * クライアントの window.onload と追加 fetch を待たず、
+ * HTML の解析中にストリームのバッファリングが始まる。
+ */
+async function buildPlayerHtml({ videoId, videoData, baseUrl, mode }) {
+  const rawUrl = (videoData && videoData.stream_url) || "";
+  const fallbackUrl = !rawUrl || rawUrl === "youtube-nocookie"
+    ? `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1`
+    : rawUrl;
+
+  const renderFallback = () => ({
+    mode: "googlevideo",
+    html: isEmbedUrl(fallbackUrl) ? iframeHtml(fallbackUrl) : videoHtml(fallbackUrl, videoId),
+  });
+
+  if (!mode || mode === "googlevideo") return renderFallback();
+
+  const resolved = await resolveModeUrl(mode, videoId, baseUrl);
+  if (!resolved) return renderFallback();
+
+  return {
+    mode,
+    html: resolved.type === "iframe" ? iframeHtml(resolved.url) : videoHtml(resolved.url, videoId),
+  };
+}
+
 app.get("/video/:id", async (req, res, next) => {
 const videoId = req.params.id;
 try {
 let videoData = null;
 let commentsData = { commentCount: 0, comments: [] };
-// 上流APIが想定外の形（文字列やcomments配列なし）を返しても再生ページの描画を壊さない
-const normalizeComments = (data) =>
-  (data && typeof data === "object" && Array.isArray(data.comments))
-    ? data
-    : { commentCount: 0, comments: [] };
-let successfulApi = null;
 
 const protocol = req.headers['x-forwarded-proto'] || 'http';
 const host = req.headers.host;
+const baseUrl = `${protocol}://${host}`;
 
-for (const apiBase of apiListCache) {
-  try {
-    videoData = await Promise.any([
-      fetchWithTimeout(`${apiBase}/api/video/${videoId}`, {}, 5000)
-        .then(res => res.ok ? res.json() : Promise.reject())
-        .then(data => data.stream_url ? data : Promise.reject()),
-      fetchWithTimeout(`${protocol}://${host}/sia-dl/${videoId}`, {}, 5000)
-        .then(res => res.ok ? res.json() : Promise.reject())
-        .then(data => data.stream_url ? data : Promise.reject()),
+// --- ストリーム取得（高速化版） ---
+// 旧実装: Promise.any( api → sia-dl → ai-fetch(2秒待ち) ) のあと rapid を直列に試し、
+//         さらにコメント取得(最大3秒)を直列で待ってからHTMLを返していた。
+// 新実装: 全取得元を同時に走らせて最速の成功を採用、コメントは並列・打ち切り付き。
+const [resolved, comments] = await Promise.all([
+  streamResolver.resolve(videoId, { apiList: apiListCache, baseUrl }),
+  streamResolver.resolveComments(videoId, { apiList: apiListCache }),
+]);
 
-      new Promise((resolve, reject) => {
-        setTimeout(() => {
-          fetchWithTimeout(`${protocol}://${host}/ai-fetch/${videoId}`, {}, 5000)
-            .then(res => res.ok ? res.json() : Promise.reject())
-            .then(data => data.stream_url ? resolve(data) : reject())
-            .catch(reject);
-        }, 2000);
-      })
-    ]);
-
-
-    try {
-      const cRes = await fetchWithTimeout(`${apiBase}/api/comments/${videoId}`, {}, 3000);
-      if (cRes.ok) commentsData = normalizeComments(await cRes.json());
-    } catch (e) {}
-
-    successfulApi = apiBase;
-    break;
-
-  } catch (e) {
-    try {
-      const rapidRes = await fetchWithTimeout(`${protocol}://${host}/rapid/${videoId}`, {}, 5000);
-      if (rapidRes.ok) {
-        const rapidData = await rapidRes.json();
-        if (rapidData.stream_url) {
-          videoData = rapidData;
-          
-          try {
-            const cRes = await fetchWithTimeout(`${apiBase}/api/comments/${videoId}`, {}, 3000);
-            if (cRes.ok) commentsData = normalizeComments(await cRes.json());
-          } catch (e) {}
-
-          successfulApi = apiBase; 
-          break; 
-        }
-      }
-    } catch (rapidErr) {}
-    continue;
+if (resolved) {
+  videoData = resolved.data;
+  if (process.env.NODE_ENV !== 'test') {
+    console.log(`[stream] ${videoId} <- ${resolved.provider} (${resolved.ms}ms, cached=${resolved.cached})`);
   }
 }
+commentsData = normalizeComments(comments);
 
-if (!videoData) {
+if (!videoData || !videoData.stream_url) {
   videoData = { videoTitle: "再生できない動画", stream_url: "youtube-nocookie" };
 }
 
-console.log(commentsData)
-let isShortForm = videoData.videoTitle.includes('#');
+// 上流がタイトルを返さない場合でもページ描画を壊さない
+videoData.videoTitle = videoData.videoTitle || "";
+videoData.channelName = videoData.channelName || "";
+
+// HTML/JS に埋め込む用。動画IDはURL由来なので必ずエンコードしてから使う。
+const safeId = encodeURIComponent(videoId);
+
+let isShortForm = String(videoData.videoTitle).includes('#');
 
 if (isShortForm) {
     try {
@@ -331,7 +900,7 @@ const shortsHtml = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>${videoData.videoTitle}</title>
+    <title>${escapeHtml(videoData.videoTitle)}</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; color: #fff; font-family: "Roboto", sans-serif; overflow: hidden; }
@@ -386,16 +955,16 @@ const shortsHtml = `
                 <div class="action-btn"><div class="btn-icon"><i class="fas fa-thumbs-down"></i></div><span>低評価</span></div>
                 <div class="action-btn" onclick="toggleComments()"><div class="btn-icon"><i class="fas fa-comment-dots"></i></div><span>${commentsData.commentCount || 0}</span></div>
                 <div class="action-btn"><div class="btn-icon"><i class="fas fa-share"></i></div><span>共有</span></div>
-                <div class="action-btn"><div class="btn-icon" style="background:none;"><img src="${videoData.channelImage || `https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=random&color=fff&size=64&bold=true`}" style="width:30px; height:30px; border-radius:4px; border:2px solid #fff;" onerror="this.src='https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=555&color=fff&size=64&bold=true'"></div></div>
+                <div class="action-btn"><div class="btn-icon" style="background:none;"><img src="${videoData.channelImage || `/api/avatar?name=${encodeURIComponent(videoData.channelName||'C')}`}" style="width:30px; height:30px; border-radius:4px; border:2px solid #fff;" onerror="this.remove()"></div></div>
             </div>
             <div class="bottom-overlay">
-                <div class="channel-info"><img src="${videoData.channelImage || `https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=random&color=fff&size=64&bold=true`}" onerror="this.src='https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=555&color=fff&size=64&bold=true'"><a href="/channel/${encodeURIComponent(videoData.channelName)}" style="text-decoration:none;color:inherit;"><span class="channel-name">@${videoData.channelName}</span></a><button id="shortSubBtn" class="subscribe-btn" onclick="toggleShortSub()">登録</button></div>
-                <div class="video-title">${videoData.videoTitle}</div>
+                <div class="channel-info"><img src="${videoData.channelImage || `/api/avatar?name=${encodeURIComponent(videoData.channelName||'C')}`}" onerror="this.remove()"><a href="/channel/${encodeURIComponent(videoData.channelName)}" style="text-decoration:none;color:inherit;"><span class="channel-name">@${escapeHtml(videoData.channelName)}</span></a><button id="shortSubBtn" class="subscribe-btn" onclick="toggleShortSub()">登録</button></div>
+                <div class="video-title">${escapeHtml(videoData.videoTitle)}</div>
             </div>
             <div id="commentsPanel" class="comments-panel">
                 <div class="comments-header"><h3 style="margin:0; font-size:16px;">コメント</h3><i class="fas fa-times" style="cursor:pointer;" onclick="toggleComments()"></i></div>
                 <div class="comments-body">
-                    ${commentsData.comments.length > 0 ? commentsData.comments.map(c => `<div class="comment-item"><img class="comment-avatar" src="${c.authorThumbnails?.[0]?.url || 'https://via.placeholder.com/32'}"><div><div style="font-size:12px; color:#aaa; font-weight:bold;">${c.author}</div><div style="font-size:14px; margin-top:2px;">${c.content}</div></div></div>`).join('') : '<p style="text-align:center; color:#888;">コメントはありません</p>'}
+                    ${commentsData.comments.length > 0 ? commentsData.comments.map(c => `<div class="comment-item"><img class="comment-avatar" src="${escapeAttr(c.authorThumbnails?.[0]?.url || 'https://via.placeholder.com/32')}"><div><div style="font-size:12px; color:#aaa; font-weight:bold;">${escapeHtml(c.author)}</div><div style="font-size:14px; margin-top:2px;">${escapeHtml(c.content)}</div></div></div>`).join('') : '<p style="text-align:center; color:#888;">コメントはありません</p>'}
                 </div>
             </div>
         </div>
@@ -407,7 +976,8 @@ const shortsHtml = `
         const swipeHint = document.getElementById('swipeHint');
         const progressBar = document.getElementById('progressBar');
 
-        window.onload = async () => {
+        // window.onload ではなく DOMContentLoaded（画像完了を待たない分だけ早く再生が始まる）
+        document.addEventListener('DOMContentLoaded', async () => {
             // 設定から保存された再生方法を取得
             const savedMode = localStorage.getItem('playbackMode') || 'googlevideo';
 
@@ -475,11 +1045,11 @@ const shortsHtml = `
             loader.classList.add('fade');
             swipeHint.classList.add('show');
             setTimeout(() => { swipeHint.classList.remove('show'); }, 300);
-        };
+        });
 
         function toggleComments() { commentsPanel.classList.toggle('open'); }
         // チャンネル登録機能（ショート）
-        const SHORT_CHANNEL = "${videoData.channelName || ''}";
+        const SHORT_CHANNEL = ${jsString(videoData.channelName || '')};
         const SHORT_SUB_KEY = 'subscribed_' + SHORT_CHANNEL;
         const shortSubBtn = document.getElementById('shortSubBtn');
         function updateShortSubBtn() {
@@ -499,7 +1069,7 @@ const shortsHtml = `
             if (commentsPanel.classList.contains('open')) return;
             loader.classList.remove('fade');
             try {
-                const params = new URLSearchParams({ title: "${videoData.videoTitle}", channel: "${videoData.channelName}", id: "${videoId}" });
+                const params = new URLSearchParams({ title: ${jsString(videoData.videoTitle)}, channel: ${jsString(videoData.channelName)}, id: ${jsString(videoId)} });
                 const res = await fetch(\`/api/recommendations?\${params.toString()}\`);
                 const data = await res.json();
                 const nextShort = data.items.find(item => item.title.includes('#')) || data.items[0];
@@ -517,8 +1087,11 @@ const shortsHtml = `
     }
 
     // --- STANDARD VIDEO MODE HTML ---
-    // playerWrapper は空にして、クライアント側JSが localStorage.playbackMode に基づいて初期化する
-const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#000;"><div class="spinner"></div></div>`;
+    // プレイヤーはサーバー側で直接書き込む（window.onload と追加fetchを待たない = 最速起動）
+const playbackMode = (req.cookies && req.cookies.playbackMode) || "googlevideo";
+const playerState = await buildPlayerHtml({ videoId, videoData, baseUrl, mode: playbackMode });
+const playerHtml = playerState.html;
+const renderedMode = playerState.mode;
 
     const html = `
 <!DOCTYPE html>
@@ -526,7 +1099,7 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${videoData.videoTitle} - YouTube Pro</title>
+    <title>${escapeHtml(videoData.videoTitle)} - YouTube Pro</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         :root { --bg-main: #0f0f0f; --bg-secondary: #272727; --bg-hover: #3f3f3f; --text-main: #f1f1f1; --text-sub: #aaaaaa; --yt-red: #ff0000; }
@@ -610,19 +1183,19 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
     <div class="main-content">
         <div class="player-container">
             <div id="playerWrapper" style="width:100%; height:100%;">
-                ${streamEmbedPlaceholder}
+                ${playerHtml}
             </div>
             <div id="videoLoadingOverlay" class="video-loading-overlay">
                 <div class="spinner"></div>
                 <div style="font-weight: bold; font-size: 16px;">動画サーバーに接続中...</div>
             </div>
         </div>
-        <h1 class="video-title">${videoData.videoTitle}</h1>
+        <h1 class="video-title">${escapeHtml(videoData.videoTitle)}</h1>
         <div class="owner-row">
             <div class="owner-info">
                 <a href="/channel/${encodeURIComponent(videoData.channelName)}" style="display:flex;align-items:center;gap:12px;text-decoration:none;color:inherit;">
-                  <img id="ownerAvatar" src="${videoData.channelImage || `https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=random&color=fff&size=80&bold=true`}" style="width:40px;height:40px;border-radius:50%;object-fit:cover;" onerror="this.src='https://ui-avatars.com/api/?name=${encodeURIComponent(videoData.channelName||'C')}&background=555&color=fff&size=80&bold=true'">
-                  <div class="channel-name">${videoData.channelName}</div>
+                  <img id="ownerAvatar" src="${videoData.channelImage || `/api/avatar?name=${encodeURIComponent(videoData.channelName||'C')}`}" style="width:40px;height:40px;border-radius:50%;object-fit:cover;" onerror="this.remove()">
+                  <div class="channel-name">${escapeHtml(videoData.channelName)}</div>
                 </a>
                 <button id="subBtn" class="btn-sub" onclick="toggleSubscribeVideo()">チャンネル登録</button>
                 <div class="server-dropdown-container">
@@ -631,12 +1204,12 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
                     </button>
                     <div id="serverMenu" class="server-menu">
                         <div class="server-option active" onclick="changeServer('googlevideo', '', event)">Googlevideo</div>
-                        <div class="server-option" onclick="changeServer('youtube-nocookie', '/nocookie/${videoId}', event)">Youtube-nocookie</div>
-                        <div class="server-option" onclick="changeServer('DL-Pro', '/360/${videoId}', event)">DL-Pro</div>
-                        <div class="server-option" onclick="changeServer('YoutubeEdu-Kahoot', '/kahoot-edu/${videoId}', event)">YoutubeEdu-Kahoot</div>
-                        <div class="server-option" onclick="changeServer('YoutubeEdu-Scratch', '/scratch-edu/${videoId}', event)">YoutubeEdu-Scratch</div>
-                        <div class="server-option" onclick="changeServer('Youtube-Pro', '/pro-stream/${videoId}', event)">Youtube-Pro</div>
-                        <div class="server-option" onclick="changeServer('Elixir-Network', '/stream-network/${videoId}', event)">Elixir-Network</div>
+                        <div class="server-option" onclick="changeServer('youtube-nocookie', '/nocookie/${safeId}', event)">Youtube-nocookie</div>
+                        <div class="server-option" onclick="changeServer('DL-Pro', '/360/${safeId}', event)">DL-Pro</div>
+                        <div class="server-option" onclick="changeServer('YoutubeEdu-Kahoot', '/kahoot-edu/${safeId}', event)">YoutubeEdu-Kahoot</div>
+                        <div class="server-option" onclick="changeServer('YoutubeEdu-Scratch', '/scratch-edu/${safeId}', event)">YoutubeEdu-Scratch</div>
+                        <div class="server-option" onclick="changeServer('Youtube-Pro', '/pro-stream/${safeId}', event)">Youtube-Pro</div>
+                        <div class="server-option" onclick="changeServer('Elixir-Network', '/stream-network/${safeId}', event)">Elixir-Network</div>
                     </div>
                 </div>
             </div>
@@ -645,13 +1218,13 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
         <div class="description-box" id="descriptionBox" onclick="toggleDescription(event)">
             <b>${videoData.videoViews || '0'} 回視聴</b>
             <div class="description-content" id="descriptionContent">
-                ${(videoData.videoDes || '').replace(/\r\n|\n|\r/g, '<br>')}
+                ${escapeHtml(videoData.videoDes || '').replace(/\r\n|\n|\r/g, '<br>')}
             </div>
             <div class="description-show-more" id="descriptionToggleBtn">全文を表示</div>
         </div>
         <div class="comments-section">
-            <h3>コメント ${commentsData.commentCount} 件</h3>
-            ${commentsData.comments.map(c => `<div class="comment-item"><img class="comment-avatar" src="${c.authorThumbnails?.[0]?.url || ''}"><div><span class="comment-author">${c.author}</span><div style="font-size:14px;">${c.content}</div></div></div>`).join('')}
+            <h3>コメント ${escapeHtml(commentsData.commentCount || 0)} 件</h3>
+            ${commentsData.comments.map(c => `<div class="comment-item"><img class="comment-avatar" src="${escapeAttr(c.authorThumbnails?.[0]?.url || '')}"><div><span class="comment-author">${escapeHtml(c.author)}</span><div style="font-size:14px;">${escapeHtml(c.content)}</div></div></div>`).join('')}
         </div>
     </div>
     <div class="sidebar">
@@ -673,7 +1246,7 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
     function toggleServerMenu() { document.getElementById('serverMenu').classList.toggle('show'); }
     window.addEventListener('click', function(e) { if (!e.target.closest('.server-dropdown-container')) { const menu = document.getElementById('serverMenu'); if (menu && menu.classList.contains('show')) menu.classList.remove('show'); } });
 
-    const VIDEO_CHANNEL = ${JSON.stringify(videoData.channelName || '')};
+    const VIDEO_CHANNEL = ${jsString(videoData.channelName || '')};
     const SUB_KEY_VIDEO = 'subscribed_' + VIDEO_CHANNEL;
     const subBtn = document.getElementById('subBtn');
     function updateSubBtnUI() {
@@ -699,9 +1272,35 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
     }
     updateSubBtnUI();
 
+    const SERVER_ENDPOINTS = {
+        'googlevideo':        '',
+        'youtube-nocookie':   '/nocookie/${safeId}',
+        'DL-Pro':             '/360/${safeId}',
+        'YoutubeEdu-Kahoot':  '/kahoot-edu/${safeId}',
+        'YoutubeEdu-Scratch': '/scratch-edu/${safeId}',
+        'Youtube-Pro':        '/pro-stream/${safeId}',
+        'Elixir-Network': '/stream-network/${safeId}'
+    };
+
+    // 選んだ動画サーバーは cookie にも保存する。
+    // 次に開く動画ページではサーバー側でそのモードのプレイヤーを直接描画できる（= 追加fetch不要）。
+    function rememberServer(serverName) {
+        localStorage.setItem('playbackMode', serverName);
+        document.cookie = 'playbackMode=' + encodeURIComponent(serverName) + '; path=/; max-age=31536000; samesite=lax';
+    }
+
+    function markActiveServerOption(serverName) {
+        const opts = document.querySelectorAll('.server-option');
+        opts.forEach(opt => opt.classList.remove('active'));
+        opts.forEach(opt => {
+            const onclick = opt.getAttribute('onclick') || '';
+            if (onclick.includes("'" + serverName + "'")) opt.classList.add('active');
+        });
+    }
+
     async function changeServer(serverName, endpointPath, event) {
         // --- 修正箇所：サーバー名を localStorage に保存 ---
-        localStorage.setItem('playbackMode', serverName);
+        rememberServer(serverName);
 
         document.getElementById('serverMenu').classList.remove('show');
         const options = document.querySelectorAll('.server-option');
@@ -723,7 +1322,9 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
         try {
             let newUrl = '';
             if (serverName === 'googlevideo') {
-                newUrl = "${videoData.stream_url}" === "youtube-nocookie" ? \`https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1\` : "${videoData.stream_url}";
+                const STREAM_URL = ${jsString(videoData.stream_url || "")};
+                const VIDEO_ID = ${jsString(videoId)};
+                newUrl = STREAM_URL === "youtube-nocookie" ? \`https://www.youtube-nocookie.com/embed/\${VIDEO_ID}?autoplay=1\` : STREAM_URL;
             } else if (serverName === 'Youtube-Pro') {
                 newUrl = endpointPath;
             } else {
@@ -765,19 +1366,21 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
         } catch (error) { console.error(error); } finally { overlay.classList.remove('active'); }
     }
 
+    const escapeText = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
     async function loadRecommendations() {
-        const params = new URLSearchParams({ title: "${videoData.videoTitle}", channel: "${videoData.channelName}", id: "${videoId}" });
+        const params = new URLSearchParams({ title: ${jsString(videoData.videoTitle)}, channel: ${jsString(videoData.channelName)}, id: ${jsString(videoId)} });
         const res = await fetch(\`/api/recommendations?\${params.toString()}\`);
         const data = await res.json();
         const shorts = data.items.filter(item => item.title.includes('#'));
         const regulars = data.items.filter(item => !item.title.includes('#'));
         document.getElementById('recommendations').innerHTML = regulars.map(item => \`
-            <a href="/video/\${item.id}" class="rec-item">
-                <div class="rec-thumb"><img src="https://i.ytimg.com/vi/\${item.id}/mqdefault.jpg"></div>
+            <a href="/video/\${encodeURIComponent(item.id)}" class="rec-item">
+                <div class="rec-thumb"><img src="https://i.ytimg.com/vi/\${encodeURIComponent(item.id)}/mqdefault.jpg" loading="lazy"></div>
                 <div class="rec-info">
-                    <div class="rec-title">\${item.title}</div>
-                    <div class="rec-meta">\${item.channelTitle}</div>
-                    <div class="rec-meta">\${item.viewCountText || ''}</div>
+                    <div class="rec-title">\${escapeText(item.title)}</div>
+                    <div class="rec-meta">\${escapeText(item.channelTitle)}</div>
+                    <div class="rec-meta">\${escapeText(item.viewCountText || '')}</div>
                 </div>
             </a>
         \`).join('');
@@ -786,36 +1389,30 @@ const streamEmbedPlaceholder = `<div style="width:100%;height:100%;display:flex;
             const grid = document.getElementById('shortsGrid');
             shelf.style.display = 'block';
             grid.innerHTML = shorts.slice(0, 4).map(item => \`
-                <a href="/video/\${item.id}" class="short-card">
-                    <div class="short-thumb"><img src="https://i.ytimg.com/vi/\${item.id}/hq720.jpg"></div>
+                <a href="/video/\${encodeURIComponent(item.id)}" class="short-card">
+                    <div class="short-thumb"><img src="https://i.ytimg.com/vi/\${encodeURIComponent(item.id)}/hq720.jpg" loading="lazy"></div>
                     <div class="short-info">
-                        <div class="short-title">\${item.title}</div>
-                        <div class="short-views">\${item.viewCountText || ''}</div>
+                        <div class="short-title">\${escapeText(item.title)}</div>
+                        <div class="short-views">\${escapeText(item.viewCountText || '')}</div>
                     </div>
                 </a>
             \`).join('');
         }
     }
-    window.onload = () => {
+    // サーバー側が描画済みのモード。これと違うモードが保存されていた時だけ差し替える。
+    const RENDERED_MODE = ${jsString(renderedMode)};
+
+    // window.onload は全リソース（画像・フォント）の完了を待ってしまうため使わない。
+    // DOMContentLoaded ならHTML解析直後に動き出し、プレイヤーは既にバッファリング済み。
+    document.addEventListener('DOMContentLoaded', () => {
+        markActiveServerOption(RENDERED_MODE);
         loadRecommendations();
 
-        // --- 修正箇所：保存された再生方法を即座に反映 ---
         const savedMode = localStorage.getItem('playbackMode') || 'googlevideo';
-        const serverEndpoints = {
-            'googlevideo':        '',
-            'youtube-nocookie':   '/nocookie/${videoId}',
-            'DL-Pro':             '/360/${videoId}',
-            'YoutubeEdu-Kahoot':  '/kahoot-edu/${videoId}',
-            'YoutubeEdu-Scratch': '/scratch-edu/${videoId}',
-            'Youtube-Pro':        '/pro-stream/${videoId}',
-            'Elixir-Network': '/stream-network/${videoId}'
-        };
-        const serverName = serverEndpoints.hasOwnProperty(savedMode) ? savedMode : 'googlevideo';
-        const endpointPath = serverEndpoints[serverName];
-
-        // 初期サーバー選択で起動
-        changeServer(serverName, endpointPath, null);
-    };
+        if (savedMode !== RENDERED_MODE && SERVER_ENDPOINTS.hasOwnProperty(savedMode)) {
+            changeServer(savedMode, SERVER_ENDPOINTS[savedMode], null);
+        }
+    });
 
     const searchInput = document.getElementById('searchInput');
     const autocompleteDropdown = document.getElementById('autocompleteDropdown');
@@ -919,7 +1516,7 @@ app.get('/rapid/:id', async (req, res) => {
     if (!channelImageUrl) {
       const name = encodeURIComponent(data.channelTitle || 'Youtube Channel');
       // UI Avatars を使用
-      channelImageUrl = `https://ui-avatars.com/api/?name=${name}&background=random&color=fff&size=128`;
+      channelImageUrl = `/api/avatar?name=${name}`;
     }
 
     const highResStream = data.adaptiveFormats?.find(f => f.qualityLabel === '1080p') || data.adaptiveFormats?.[0];
@@ -952,6 +1549,21 @@ app.get("/api/comments/:videoId", async (req, res) => {
   const videoId = req.params.videoId;
   const continuation = req.query.continuation || ""; // 続きのトークン
 
+  // 高速経路: InnerTube。継続トークンは受け取り側で正規化するので
+  // 「二重エンコードで 400 → ずっと続きが読めない」が起きない。
+  if (YT_META_ENABLED) {
+    try {
+      const data = continuation
+        ? await ytMeta.commentsNext(continuation)
+        : await ytMeta.comments(videoId);
+      if (data && Array.isArray(data.comments) && (data.comments.length || data.commentCount)) {
+        return res.json(data);
+      }
+    } catch (err) {
+      console.warn("[yt-meta] comments fallback:", err && err.message);
+    }
+  }
+
   for (const apiBase of apiListCache) {
     try {
       // 既存の取得ロジックに continuation を乗せる
@@ -963,23 +1575,11 @@ app.get("/api/comments/:videoId", async (req, res) => {
       }
     } catch (e) { continue; }
   }
-  res.status(500).json({ error: "コメントの取得に失敗しました" });
+  // 取得元が全滅しても 500 にしない（UI は「0件」として扱える）
+  res.json({ commentCount: 0, comments: [], continuation: null });
 });
 
 // --- 修正: 既存の /api/channel (ページングをより確実に) ---
-app.get("/api/channel", async (req, res) => {
-  const channelName = req.query.name || req.query.id;
-  const page = parseInt(req.query.page) || 0;
-  if (!channelName) return res.status(400).json({ error: "name required" });
-  try {
-    // 既存の yts を使用
-    const results = await yts.GetListByKeyword(channelName, false, 20); // ytsの仕様に合わせる
-    const videos = (results.items || []).filter(item => item.type === 'video');
-    res.json({ channelName, videos, nextPage: page + 1 });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.get('/streams', (req, res) => {
     const cacheData = Object.fromEntries(videoCache);
@@ -1071,7 +1671,7 @@ app.get('/pro-stream/:videoId', (req, res) => {
 </div>
 
 <script>
-const VIDEO_ID = ${JSON.stringify(videoId)};
+const VIDEO_ID = ${jsString(videoId)};
 const ENDPOINTS = [
   {name:'/scratch-edu', path:'/scratch-edu/' + VIDEO_ID},
   {name:'/kahoot-edu', path:'/kahoot-edu/' + VIDEO_ID},
@@ -1432,7 +2032,7 @@ app.get('/ai-fetch/:videoId', async (req, res) => {
             videoId: videoId,
             channelId: "", 
             channelName: channelName, 
-            channelImage: `https://ui-avatars.com/api/?name=${encodeURIComponent(channelName)}&background=random&color=fff&size=128`,
+            channelImage: `/api/avatar?name=${encodeURIComponent(channelName)}`,
             videoTitle: videoTitle, 
             videoDes: videoDes,
             videoViews: videoViews,
@@ -1605,21 +2205,54 @@ app.get("/api/channel", async (req, res) => {
   const page = parseInt(req.query.page) || 0;
   if (!channelName) return res.status(400).json({ error: "name required" });
   try {
-    // 取得件数を20に設定
-    const results = await yts.GetListByKeyword(channelName, false, 20, page);
-    const videos = (results.items || []).filter(item => item.type === 'video');
+    // 取得件数を20に設定（ブロック環境では従来経路を呼ばない）
+    const videos = await legacySearch(channelName, 20, page);
     res.json({ channelName, videos, nextPage: page + 1 });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// チャンネル情報（ページは authorThumbnails / description / subCount を読む）
+// 以前は Invidious の1インスタンス直依存で、そこが落ちるとチャンネルアイコンが
+// 永久に表示されなかった。InnerTube を本線にし、Invidious は保険に回す。
+const INVIDIOUS_CHANNEL = process.env.INVIDIOUS_CHANNEL_API ||
+  'https://yt.chocolatemoo53.com/api/v1/search';
+
+/** 「12.3万人の登録者」→「12.3万」（ページ側が " 人の登録者" を足すため） */
+function subCountForPage(text) {
+  const m = String(text || '').match(/([\d.,]+\s*[万億KMB]?)/);
+  return m ? m[1].replace(/\s+/g, '') : '';
+}
+
 app.get('/api/inv/channel/:name', async (req, res) => {
   const channelName = req.params.name;
+  if (!channelName) return res.status(400).json({ error: 'name required' });
 
-  const url = `https://yt.chocolatemoo53.com/api/v1/search?q=${encodeURIComponent(
-    channelName
-  )}&type=channel`;
+  // 1) 本線: InnerTube（検索・メタデータ専用。ストリームは触らない）
+  try {
+    const data = await ytMeta.channel(channelName, { limit: 20 });
+    if (data && data.channelName) {
+      const mapped = {
+        author: data.channelName,
+        authorId: data.id || '',
+        authorThumbnails: data.channelImage ? [{ url: data.channelImage, width: 176, height: 176 }] : [],
+        description: data.description || '',
+        subCount: subCountForPage(data.subscriberText),
+        videoCount: data.videoCountText || '',
+        _source: 'innertube',
+      };
+      if (mapped.authorThumbnails.length || mapped.subCount) {
+        return res.json([mapped]);
+      }
+      // アイコンも登録者数も取れなければ保険に流す
+    }
+  } catch (err) {
+    if (process.env.YT_META_DEBUG) console.warn('[inv/channel] innertube failed:', err.message);
+  }
+
+  // 2) 保険: Invidious
+  const url = `${INVIDIOUS_CHANNEL}?q=${encodeURIComponent(channelName)}&type=channel`;
 
   try {
     const response = await fetch(url);
