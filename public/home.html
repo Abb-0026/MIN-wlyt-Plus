@@ -1366,6 +1366,22 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
 </script>
 
   <script>
+    // HTML として埋め込む前にエスケープする（動画タイトルは外部由来なので必ず通す）
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+      ));
+    }
+
+    // 外部から来た URL を src に埋め込む前に検証する（javascript: や引用符抜けを弾く）
+    function safeUrl(url) {
+      const s = String(url == null ? '' : url);
+      if (!s) return '';
+      if (/^https?:\/\//i.test(s)) return s;
+      if (/^\/[^/]/.test(s)) return s; // サイト内相対パス
+      return '';
+    }
+
     // ===== Thumbnail Server Logic =====
     function getThumbUrl(id, type) {
       const mode = localStorage.getItem('thumbServer') || 'default';
@@ -1554,10 +1570,10 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
               const viewText = item.viewCountText || '';
               a.innerHTML = `
                 <div class="short-thumb">
-                  <img src="${thumbUrl}" loading="lazy" alt="${item.title || 'ショート'}">
+                  <img src="${esc(thumbUrl)}" loading="lazy" alt="${esc(item.title || 'ショート')}">
                   <div class="short-overlay">
-                    <div class="short-title">${item.title || ''}</div>
-                    <div class="short-views">${viewText}</div>
+                    <div class="short-title">${esc(item.title || '')}</div>
+                    <div class="short-views">${esc(viewText)}</div>
                   </div>
                 </div>
               `;
@@ -1580,26 +1596,26 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           const published = item.publishedTimeText || '';
           const initial = channel ? channel[0].toUpperCase() : 'C';
           // チャンネルアバター画像URL（ui-avatars フォールバック）
-          const avatarUrl = item.channelThumbnail || item.channelImage || '';
+          const avatarUrl = safeUrl(item.channelThumbnail || item.channelImage || '');
           const subKey = 'subscribed_' + channel;
           const isSub = localStorage.getItem(subKey) === 'true';
 
           card.innerHTML = `
             <div class="thumb">
-              <img src="${thumbUrl}" loading="lazy" alt="${item.title || '動画'}">
-              ${item.lengthText ? `<div class="duration-badge">${item.lengthText}</div>` : ''}
+              <img src="${esc(thumbUrl)}" loading="lazy" alt="${esc(item.title || '動画')}">
+              ${item.lengthText ? `<div class="duration-badge">${esc(item.lengthText)}</div>` : ''}
             </div>
             <div class="meta">
-              <a href="/channel/${encodeURIComponent(channel)}" class="channel-avatar" data-initial="${initial}" onclick="event.stopPropagation()" style="text-decoration:none;">
-                <span class="avatar-initial">${initial}</span>
-                ${avatarUrl ? `<img src="${avatarUrl}" alt="${channel}" onload="this.classList.add('loaded')" onerror="this.remove()">` : ''}
+              <a href="/channel/${encodeURIComponent(channel)}" class="channel-avatar" data-initial="${esc(initial)}" onclick="event.stopPropagation()" style="text-decoration:none;">
+                <span class="avatar-initial">${esc(initial)}</span>
+                ${avatarUrl ? `<img src="${esc(avatarUrl)}" alt="${esc(channel)}" onload="this.classList.add('loaded')" onerror="this.remove()">` : ''}
               </a>
               <div class="details">
-                <h3>${item.title || ''}</h3>
-                <a href="/channel/${encodeURIComponent(channel)}" class="channel-name" onclick="event.stopPropagation()" style="text-decoration:none;color:var(--text-muted);">${channel}</a>
-                <div class="video-stats">${viewText}${viewText && published ? ' • ' : ''}${published || item.publishedTimeText || ''}</div>
+                <h3>${esc(item.title || '')}</h3>
+                <a href="/channel/${encodeURIComponent(channel)}" class="channel-name" onclick="event.stopPropagation()" style="text-decoration:none;color:var(--text-muted);">${esc(channel)}</a>
+                <div class="video-stats">${esc(viewText)}${viewText && published ? ' • ' : ''}${esc(published || item.publishedTimeText || '')}</div>
               </div>
-              <button class="card-menu-btn" aria-label="メニュー" data-id="${item.id}" data-title="${(item.title||'').replace(/"/g,'&quot;')}" data-channel="${channel.replace(/"/g,'&quot;')}" data-views="${viewText}" data-published="${published}">⋮</button>
+              <button class="card-menu-btn" aria-label="メニュー" data-id="${esc(item.id)}" data-title="${esc(item.title||'')}" data-channel="${esc(channel)}" data-views="${esc(viewText)}" data-published="${esc(published)}">⋮</button>
             </div>
           `;
           // アバター画像がない場合はui-avatarsから取得
@@ -1981,10 +1997,10 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
             const thumbUrl = getThumbUrl(item.id, 'hq');
             a.innerHTML = `
               <div class="short-thumb">
-                <img src="${thumbUrl}" loading="lazy" alt="${item.title || 'ショート'}">
+                <img src="${esc(thumbUrl)}" loading="lazy" alt="${esc(item.title || 'ショート')}">
                 <div class="short-overlay">
-                  <div class="short-title">${item.title || ''}</div>
-                  <div class="short-views">${item.viewCountText || ''}</div>
+                  <div class="short-title">${esc(item.title || '')}</div>
+                  <div class="short-views">${esc(item.viewCountText || '')}</div>
                 </div>
               </div>
             `;
@@ -2004,25 +2020,25 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           const viewText = item.viewCountText || '';
           const published = item.publishedTimeText || '';
           const initial = channel ? channel[0].toUpperCase() : 'C';
-          const avatarUrl = item.channelThumbnail || item.channelImage || '';
+          const avatarUrl = safeUrl(item.channelThumbnail || item.channelImage || '');
           const subKey = 'subscribed_' + channel;
           const isSub = localStorage.getItem(subKey) === 'true';
           card.innerHTML = `
             <div class="thumb">
-              <img src="${thumbUrl}" loading="lazy" alt="${item.title || '動画'}">
-              ${item.lengthText ? `<div class="duration-badge">${item.lengthText}</div>` : ''}
+              <img src="${esc(thumbUrl)}" loading="lazy" alt="${esc(item.title || '動画')}">
+              ${item.lengthText ? `<div class="duration-badge">${esc(item.lengthText)}</div>` : ''}
             </div>
             <div class="meta">
-              <a href="/channel/${encodeURIComponent(channel)}" class="channel-avatar" data-initial="${initial}" onclick="event.stopPropagation()" style="text-decoration:none;">
-                <span class="avatar-initial">${initial}</span>
-                ${avatarUrl ? `<img src="${avatarUrl}" alt="${channel}" onload="this.classList.add('loaded')" onerror="this.remove()">` : ''}
+              <a href="/channel/${encodeURIComponent(channel)}" class="channel-avatar" data-initial="${esc(initial)}" onclick="event.stopPropagation()" style="text-decoration:none;">
+                <span class="avatar-initial">${esc(initial)}</span>
+                ${avatarUrl ? `<img src="${esc(avatarUrl)}" alt="${esc(channel)}" onload="this.classList.add('loaded')" onerror="this.remove()">` : ''}
               </a>
               <div class="details">
-                <h3>${item.title || ''}</h3>
-                <a href="/channel/${encodeURIComponent(channel)}" class="channel-name" onclick="event.stopPropagation()" style="text-decoration:none;color:var(--text-muted);">${channel}</a>
-                <div class="video-stats">${viewText}${viewText && published ? ' • ' : ''}${published || item.publishedTimeText || ''}</div>
+                <h3>${esc(item.title || '')}</h3>
+                <a href="/channel/${encodeURIComponent(channel)}" class="channel-name" onclick="event.stopPropagation()" style="text-decoration:none;color:var(--text-muted);">${esc(channel)}</a>
+                <div class="video-stats">${esc(viewText)}${viewText && published ? ' • ' : ''}${esc(published || item.publishedTimeText || '')}</div>
               </div>
-              <button class="card-menu-btn" aria-label="メニュー" data-id="${item.id}" data-title="${(item.title||'').replace(/"/g,'&quot;')}" data-channel="${channel.replace(/"/g,'&quot;')}" data-views="${viewText}" data-published="${published}">⋮</button>
+              <button class="card-menu-btn" aria-label="メニュー" data-id="${esc(item.id)}" data-title="${esc(item.title||'')}" data-channel="${esc(channel)}" data-views="${esc(viewText)}" data-published="${esc(published)}">⋮</button>
             </div>
           `;
           if (!avatarUrl) {

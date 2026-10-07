@@ -52,6 +52,40 @@ test('manifest, service worker, and icons map to files that exist', () => {
   }
 });
 
+test('metadata fast path never touches the player endpoint (streams stay API-dependent)', () => {
+  const yt = read('lib/yt-innertube.js');
+  assert.doesNotMatch(yt, /['"`]player['"`]/, 'player エンドポイントは使わない');
+  assert.doesNotMatch(yt, /streamingData|formats\[|adaptiveFormats/, 'ストリーム解析を含めない');
+});
+
+test('metadata fast path is additive: yts fallback still reachable in every handler', () => {
+  for (const handler of ['/api/search', '/api/trending', '/api/recommendations']) {
+    const block = index.slice(index.indexOf(`app.get("${handler}"`));
+    const body = block.slice(0, block.indexOf('\napp.get('));
+    assert.match(body, /fastMeta\(/, `${handler} に高速経路がある`);
+    assert.match(body, /yts\.GetListByKeyword/, `${handler} の従来経路が残っている`);
+  }
+  // コメント継続は従来の API ループも残す
+  const comments = index.slice(index.indexOf('app.get("/api/comments/:videoId"'));
+  assert.match(comments, /ytMeta\.commentsNext\(/);
+  assert.match(comments, /apiListCache/);
+});
+
+test('home.html escapes external metadata before injecting it into innerHTML', () => {
+  const home = read('public/home.html');
+  assert.match(home, /function esc\(s\)/);
+  assert.match(home, /function safeUrl\(url\)/);
+  // 生の item.title / channelTitle を innerHTML へ直接埋めない
+  assert.doesNotMatch(home, /\$\{item\.title[^}]*\}[^}]*<h3>/);
+  for (const raw of ['${item.title}', '${item.channelTitle}', '${item.viewCountText}', '${item.lengthText}']) {
+    assert.equal(home.split(raw).length - 1, 0, `${raw} は必ず esc() を通す`);
+  }
+  // アバター URL は常に safeUrl() を通る
+  const avatars = home.match(/const avatarUrl = .*/g) || [];
+  assert.equal(avatars.length, 2);
+  for (const line of avatars) assert.match(line, /safeUrl\(/);
+});
+
 test('service worker only precaches valid app-shell paths', () => {
   const match = serviceWorker.match(/const PRECACHE = (\[[\s\S]*?\]);/);
   assert.ok(match, 'PRECACHE list should be present');

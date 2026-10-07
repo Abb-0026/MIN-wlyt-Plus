@@ -7,6 +7,7 @@ const cookieParser = require("cookie-parser");
 const https = require("https");
 const fs = require('fs');
 const { StreamResolver, normalizeComments } = require("./lib/stream-resolver");
+const { YtMetadata } = require("./lib/yt-innertube");
 
 let wispServer = null;
 try {
@@ -85,6 +86,57 @@ function fetchWithTimeout(url, options = {}, timeout = 5000) {
 // --- ストリーム解決（全取得元を並列レース + メモリキャッシュ） ---
 const streamResolver = new StreamResolver({ fetchImpl: fetch, timeout: 4000, deadline: 6000 });
 
+// --- メタデータ解決（InnerTube 直結の高速経路。失敗時は従来の yts 経路へフォールバック） ---
+// YT_META=0 で無効化できる。ストリームはここを通らない（player エンドポイントは叩かない）。
+const YT_META_ENABLED = process.env.YT_META !== "0";
+const ytMeta = new YtMetadata({
+  fetchImpl: fetch,
+  timeout: 6000,
+  hedgeMs: 400,
+  logger: (msg, extra) => {
+    if (process.env.YT_META_DEBUG === "1") console.log(msg, extra || "");
+  },
+});
+
+if (YT_META_ENABLED) {
+  ytMeta.warmup(); // 起動時に裏で visitorData とトレンドを温める（初回の1往復を隠す）
+  setInterval(() => ytMeta.sweep(), 300000);
+}
+
+/** 表示順を毎回シャッフルする（Fisher-Yates） */
+function shuffle(list) {
+  const arr = list.slice();
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+/**
+ * 高速経路を試し、空振り（失敗・0件）なら従来の取得処理を実行する。
+ * 「追加」なので、どちらも失敗したときの振る舞いは今までどおり。
+ */
+async function fastMeta(name, attempt, fallback, { timeout = 3500 } = {}) {
+  if (!YT_META_ENABLED) return fallback();
+  let timer;
+  const budget = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${name} fast-path timeout`)), timeout);
+  });
+  const job = attempt();
+  job.catch(() => {}); // 予算超過で負けた分の unhandled rejection を握りつぶす
+  try {
+    const out = await Promise.race([job, budget]);
+    if (out && (!Array.isArray(out.items) || out.items.length > 0)) return out;
+    throw new Error(`${name} fast-path empty`);
+  } catch (err) {
+    console.warn(`[yt-meta] ${name} fallback:`, err && err.message);
+    return fallback();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // 動的レスポンス（HTML/JSON）は Service Worker にもブラウザにもキャッシュさせない。
 // キャッシュされると「動画ページに遷移できない / 古いストリームURLで再生できない」不具合になる。
 // ただしプロキシのフロントエンドは静的アセットなので、従来どおりキャッシュさせる。
@@ -147,6 +199,17 @@ app.get("/", (req, res) => {
 app.get("/api/trending", async (req, res) => {
   const page = parseInt(req.query.page) || 0;
   try {
+    // 高速経路: browse 1往復（キャッシュ済みなら0往復）
+    const fast = await fastMeta(
+      "trending",
+      async () => {
+        const out = await ytMeta.trending({ page });
+        return out && out.items && out.items.length ? { items: shuffle(out.items) } : null;
+      },
+      () => null
+    );
+    if (fast && fast.items && fast.items.length) return res.json(fast);
+
     const trendingSeeds = [
       "人気急上昇", "最新 ニュース", "Music Video Official", 
       "ゲーム実況 人気", "話題の動画", "トレンド", 
@@ -189,15 +252,42 @@ app.get("/api/search", async (req, res, next) => {
   const page = req.query.page || 0;
   if (!query) return res.status(400).json({ error: "Query required" });
   try {
+    // 高速経路: search 1往復（キャッシュ済みなら0往復）。従来は公開ページのスクレイピング。
+    const fast = await fastMeta(
+      "search",
+      () => ytMeta.search(query, { page: parseInt(page) || 0 }),
+      () => null
+    );
+    if (fast && fast.items && fast.items.length) return res.json(fast);
+
     const results = await yts.GetListByKeyword(query, false, 20, page);
     res.json(results);
-  } catch (err) { next(err); }
+  } catch (err) {
+    // 取得元が全滅しても 500 の HTML を返さない（UI が静止するので 0 件で返す）
+    console.error("Search API Error:", err && err.message);
+    res.json({ items: [] });
+  }
 });
 
 
 app.get("/api/recommendations", async (req, res) => {
   const { title, channel, id } = req.query;
   try {
+    // 高速経路: next 1往復で「この動画の関連動画」をそのまま取る。
+    // 従来は yts に3往復（トピック/チャンネル/関連）していた。
+    if (id) {
+      const fast = await fastMeta(
+        "recommendations",
+        async () => {
+          const meta = await ytMeta.videoMeta(String(id));
+          const items = (meta.related || []).filter((it) => it && it.id && it.id !== id);
+          return items.length ? { items: shuffle(items) } : null;
+        },
+        () => null
+      );
+      if (fast && fast.items && fast.items.length) return res.json(fast);
+    }
+
     const cleanKwd = title
       .replace(/[【】「」()!！?？\[\]]/g, ' ')
       .replace(/\s+/g, ' ')
@@ -1066,6 +1156,21 @@ app.get('/rapid/:id', async (req, res) => {
 app.get("/api/comments/:videoId", async (req, res) => {
   const videoId = req.params.videoId;
   const continuation = req.query.continuation || ""; // 続きのトークン
+
+  // 高速経路: InnerTube。継続トークンは受け取り側で正規化するので
+  // 「二重エンコードで 400 → ずっと続きが読めない」が起きない。
+  if (YT_META_ENABLED) {
+    try {
+      const data = continuation
+        ? await ytMeta.commentsNext(continuation)
+        : await ytMeta.comments(videoId);
+      if (data && Array.isArray(data.comments) && (data.comments.length || data.commentCount)) {
+        return res.json(data);
+      }
+    } catch (err) {
+      console.warn("[yt-meta] comments fallback:", err && err.message);
+    }
+  }
 
   for (const apiBase of apiListCache) {
     try {

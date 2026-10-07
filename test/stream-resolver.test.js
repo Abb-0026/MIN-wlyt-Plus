@@ -21,6 +21,12 @@ const LATENCY = {
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 「応答しない」を再現するタイマー。プロセスの終了を妨げないよう unref する
+// （unref しないとテスト全体が 100 秒ぶん余計に待たされる）。
+const hang = () => new Promise((r) => {
+  const t = setTimeout(r, 99999);
+  if (typeof t.unref === 'function') t.unref();
+});
 const jsonResponse = (body, ms) =>
   sleep(ms).then(() => ({ ok: true, status: 200, json: async () => body }));
 
@@ -44,7 +50,7 @@ function makeFetch({ fail = new Set() } = {}) {
       );
     }
     if (url.includes('/api/comments/')) {
-      if (fail.has('comments')) return sleep(99999).then(() => { throw new Error('hang'); });
+      if (fail.has('comments')) return hang().then(() => { throw new Error('hang'); });
       return jsonResponse({ commentCount: 2, comments: [{ author: 'a', content: 'b' }] }, LATENCY.comments);
     }
     if (url.includes('/sia-dl/')) {
