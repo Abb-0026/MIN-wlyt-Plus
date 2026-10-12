@@ -6,7 +6,7 @@ const fetch = require("node-fetch");
 const cookieParser = require("cookie-parser");
 const https = require("https");
 const fs = require('fs');
-const { StreamResolver, normalizeComments } = require("./lib/stream-resolver");
+const { StreamResolver } = require("./lib/stream-resolver");
 const { YtMetadata, textOf } = require("./lib/yt-innertube");
 const { buildSearchParams, filtersFromQuery } = require("./lib/search-filters");
 const { createProxiedFetch, proxiesFromEnv, parseProxyList } = require("./lib/proxy-tunnel");
@@ -303,6 +303,38 @@ function fetchWithTimeout(url, options = {}, timeout = 5000) {
       setTimeout(() => reject(new Error(`Timeout after ${timeout}ms`)), timeout)
     )
   ]);
+}
+
+// ストリーム提供元の上流リクエストを、タイムアウト時に実際に中断する。
+// Promise.race だけで待ち切るとソケットが残り、次の動画取得を遅らせるため。
+async function fetchWithAbort(url, options = {}, timeout = 3500, read = async (response) => response) {
+  const controller = new AbortController();
+  const parentSignal = options.signal;
+  const abortFromParent = () => controller.abort(parentSignal && parentSignal.reason);
+  if (parentSignal) {
+    if (parentSignal.aborted) abortFromParent();
+    else parentSignal.addEventListener('abort', abortFromParent, { once: true });
+  }
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    return await read(response);
+  } finally {
+    clearTimeout(timer);
+    if (parentSignal) parentSignal.removeEventListener('abort', abortFromParent);
+  }
+}
+
+function abortOnResponseClose(res) {
+  const controller = new AbortController();
+  const abortIfDisconnected = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  res.on('close', abortIfDisconnected);
+  return {
+    signal: controller.signal,
+    cleanup: () => res.removeListener('close', abortIfDisconnected),
+  };
 }
 
 // --- ストリーム解決（全取得元を並列レース + メモリキャッシュ） ---
@@ -835,20 +867,16 @@ app.get("/video/:id", async (req, res, next) => {
 const videoId = req.params.id;
 try {
 let videoData = null;
-let commentsData = { commentCount: 0, comments: [] };
+// コメントはプレイヤー表示のクリティカルパスから外し、ページ表示後に必要なタイミングで取得する。
 
 const protocol = req.headers['x-forwarded-proto'] || 'http';
 const host = req.headers.host;
 const baseUrl = `${protocol}://${host}`;
 
 // --- ストリーム取得（高速化版） ---
-// 旧実装: Promise.any( api → sia-dl → ai-fetch(2秒待ち) ) のあと rapid を直列に試し、
-//         さらにコメント取得(最大3秒)を直列で待ってからHTMLを返していた。
-// 新実装: 全取得元を同時に走らせて最速の成功を採用、コメントは並列・打ち切り付き。
-const [resolved, comments] = await Promise.all([
-  streamResolver.resolve(videoId, { apiList: apiListCache, baseUrl }),
-  streamResolver.resolveComments(videoId, { apiList: apiListCache }),
-]);
+// 動画本体が再生可能になった時点で HTML を返す。コメントは /api/comments から後読みし、
+// 上流のコメントAPIが遅いときもプレイヤー表示を待たせない。
+const resolved = await streamResolver.resolve(videoId, { apiList: apiListCache, baseUrl });
 
 if (resolved) {
   videoData = resolved.data;
@@ -856,7 +884,6 @@ if (resolved) {
     console.log(`[stream] ${videoId} <- ${resolved.provider} (${resolved.ms}ms, cached=${resolved.cached})`);
   }
 }
-commentsData = normalizeComments(comments);
 
 if (!videoData || !videoData.stream_url) {
   videoData = { videoTitle: "再生できない動画", stream_url: "youtube-nocookie" };
@@ -953,7 +980,7 @@ const shortsHtml = `
             <div class="side-bar">
                 <div class="action-btn"><div class="btn-icon"><i class="fas fa-thumbs-up"></i></div><span>${videoData.likeCount || '評価'}</span></div>
                 <div class="action-btn"><div class="btn-icon"><i class="fas fa-thumbs-down"></i></div><span>低評価</span></div>
-                <div class="action-btn" onclick="toggleComments()"><div class="btn-icon"><i class="fas fa-comment-dots"></i></div><span>${commentsData.commentCount || 0}</span></div>
+                <div class="action-btn" onclick="toggleComments()"><div class="btn-icon"><i class="fas fa-comment-dots"></i></div><span id="commentCount">…</span></div>
                 <div class="action-btn"><div class="btn-icon"><i class="fas fa-share"></i></div><span>共有</span></div>
                 <div class="action-btn"><div class="btn-icon" style="background:none;"><img src="${videoData.channelImage || `/api/avatar?name=${encodeURIComponent(videoData.channelName||'C')}`}" style="width:30px; height:30px; border-radius:4px; border:2px solid #fff;" onerror="this.remove()"></div></div>
             </div>
@@ -963,8 +990,8 @@ const shortsHtml = `
             </div>
             <div id="commentsPanel" class="comments-panel">
                 <div class="comments-header"><h3 style="margin:0; font-size:16px;">コメント</h3><i class="fas fa-times" style="cursor:pointer;" onclick="toggleComments()"></i></div>
-                <div class="comments-body">
-                    ${commentsData.comments.length > 0 ? commentsData.comments.map(c => `<div class="comment-item"><img class="comment-avatar" src="${escapeAttr(c.authorThumbnails?.[0]?.url || 'https://via.placeholder.com/32')}"><div><div style="font-size:12px; color:#aaa; font-weight:bold;">${escapeHtml(c.author)}</div><div style="font-size:14px; margin-top:2px;">${escapeHtml(c.content)}</div></div></div>`).join('') : '<p style="text-align:center; color:#888;">コメントはありません</p>'}
+                <div class="comments-body" id="commentsBody" data-comments-list>
+                    <p style="text-align:center; color:#888;">コメントを読み込み中…</p>
                 </div>
             </div>
         </div>
@@ -973,8 +1000,71 @@ const shortsHtml = `
         let startY = 0;
         const loader = document.getElementById('loader');
         const commentsPanel = document.getElementById('commentsPanel');
+        const commentsBody = document.getElementById('commentsBody');
+        const commentCountEl = document.getElementById('commentCount');
         const swipeHint = document.getElementById('swipeHint');
         const progressBar = document.getElementById('progressBar');
+        const commentsEndpoint = ${jsString(`/api/comments/${safeId}`)};
+        let commentsLoadPromise = null;
+
+        function renderComments(data) {
+            const comments = Array.isArray(data && data.comments) ? data.comments : [];
+            const count = Number(data && data.commentCount) || 0;
+            commentCountEl.textContent = count > 0 ? count.toLocaleString() : '0';
+            commentsBody.replaceChildren();
+
+            if (!comments.length) {
+                const empty = document.createElement('p');
+                empty.style.cssText = 'text-align:center;color:#888;';
+                empty.textContent = 'コメントはありません';
+                commentsBody.appendChild(empty);
+                return;
+            }
+
+            const fragment = document.createDocumentFragment();
+            comments.slice(0, 50).forEach((comment) => {
+                const row = document.createElement('div');
+                row.className = 'comment-item';
+                const avatar = document.createElement('img');
+                avatar.className = 'comment-avatar';
+                avatar.alt = '';
+                avatar.loading = 'lazy';
+                const avatarUrl = comment && comment.authorThumbnails && comment.authorThumbnails[0]
+                    ? comment.authorThumbnails[0].url : '';
+                if (/^https?:\\/\\//i.test(String(avatarUrl || ''))) avatar.src = avatarUrl;
+                else avatar.hidden = true;
+
+                const body = document.createElement('div');
+                const author = document.createElement('div');
+                author.style.cssText = 'font-size:12px;color:#aaa;font-weight:bold;';
+                author.textContent = String((comment && comment.author) || '');
+                const text = document.createElement('div');
+                text.style.cssText = 'font-size:14px;margin-top:2px;';
+                text.textContent = String((comment && comment.content) || '');
+                body.append(author, text);
+                row.append(avatar, body);
+                fragment.appendChild(row);
+            });
+            commentsBody.appendChild(fragment);
+        }
+
+        function loadComments() {
+            if (commentsLoadPromise) return commentsLoadPromise;
+            commentsLoadPromise = fetch(commentsEndpoint, { headers: { Accept: 'application/json' } })
+                .then((response) => {
+                    if (!response.ok) throw new Error('comments request failed');
+                    return response.json();
+                })
+                .then(renderComments)
+                .catch(() => {
+                    const message = document.createElement('p');
+                    message.style.cssText = 'text-align:center;color:#888;';
+                    message.textContent = 'コメントを読み込めませんでした';
+                    commentsBody.replaceChildren(message);
+                    commentsLoadPromise = null;
+                });
+            return commentsLoadPromise;
+        }
 
         // window.onload ではなく DOMContentLoaded（画像完了を待たない分だけ早く再生が始まる）
         document.addEventListener('DOMContentLoaded', async () => {
@@ -1047,7 +1137,10 @@ const shortsHtml = `
             setTimeout(() => { swipeHint.classList.remove('show'); }, 300);
         });
 
-        function toggleComments() { commentsPanel.classList.toggle('open'); }
+        function toggleComments() {
+            const isOpen = commentsPanel.classList.toggle('open');
+            if (isOpen) loadComments();
+        }
         // チャンネル登録機能（ショート）
         const SHORT_CHANNEL = ${jsString(videoData.channelName || '')};
         const SHORT_SUB_KEY = 'subscribed_' + SHORT_CHANNEL;
@@ -1222,9 +1315,11 @@ const renderedMode = playerState.mode;
             </div>
             <div class="description-show-more" id="descriptionToggleBtn">全文を表示</div>
         </div>
-        <div class="comments-section">
-            <h3>コメント ${escapeHtml(commentsData.commentCount || 0)} 件</h3>
-            ${commentsData.comments.map(c => `<div class="comment-item"><img class="comment-avatar" src="${escapeAttr(c.authorThumbnails?.[0]?.url || '')}"><div><span class="comment-author">${escapeHtml(c.author)}</span><div style="font-size:14px;">${escapeHtml(c.content)}</div></div></div>`).join('')}
+        <div class="comments-section" id="commentsSection">
+            <h3>コメント <span id="commentCount">…</span> 件</h3>
+            <div class="comments-list" data-comments-list>
+                <p class="comments-loading">コメントを読み込み中…</p>
+            </div>
         </div>
     </div>
     <div class="sidebar">
@@ -1368,6 +1463,70 @@ const renderedMode = playerState.mode;
 
     const escapeText = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+    const commentsEndpoint = ${jsString(`/api/comments/${safeId}`)};
+    const commentsList = document.querySelector('[data-comments-list]');
+    const commentCountEl = document.getElementById('commentCount');
+    let commentsLoadPromise = null;
+
+    function renderComments(data) {
+        const comments = Array.isArray(data && data.comments) ? data.comments : [];
+        const count = Number(data && data.commentCount) || 0;
+        commentCountEl.textContent = count > 0 ? count.toLocaleString() : '0';
+        commentsList.replaceChildren();
+
+        if (!comments.length) {
+            const empty = document.createElement('p');
+            empty.className = 'comments-loading';
+            empty.textContent = 'コメントはありません';
+            commentsList.appendChild(empty);
+            return;
+        }
+
+        const fragment = document.createDocumentFragment();
+        comments.slice(0, 50).forEach((comment) => {
+            const row = document.createElement('div');
+            row.className = 'comment-item';
+            const avatar = document.createElement('img');
+            avatar.className = 'comment-avatar';
+            avatar.alt = '';
+            avatar.loading = 'lazy';
+            const avatarUrl = comment && comment.authorThumbnails && comment.authorThumbnails[0]
+                ? comment.authorThumbnails[0].url : '';
+            if (/^https?:\\/\\//i.test(String(avatarUrl || ''))) avatar.src = avatarUrl;
+            else avatar.hidden = true;
+
+            const body = document.createElement('div');
+            const author = document.createElement('span');
+            author.className = 'comment-author';
+            author.textContent = String((comment && comment.author) || '');
+            const text = document.createElement('div');
+            text.style.fontSize = '14px';
+            text.textContent = String((comment && comment.content) || '');
+            body.append(author, text);
+            row.append(avatar, body);
+            fragment.appendChild(row);
+        });
+        commentsList.appendChild(fragment);
+    }
+
+    function loadComments() {
+        if (commentsLoadPromise) return commentsLoadPromise;
+        commentsLoadPromise = fetch(commentsEndpoint, { headers: { Accept: 'application/json' } })
+            .then((response) => {
+                if (!response.ok) throw new Error('comments request failed');
+                return response.json();
+            })
+            .then(renderComments)
+            .catch(() => {
+                const message = document.createElement('p');
+                message.className = 'comments-loading';
+                message.textContent = 'コメントを読み込めませんでした';
+                commentsList.replaceChildren(message);
+                commentsLoadPromise = null;
+            });
+        return commentsLoadPromise;
+    }
+
     async function loadRecommendations() {
         const params = new URLSearchParams({ title: ${jsString(videoData.videoTitle)}, channel: ${jsString(videoData.channelName)}, id: ${jsString(videoId)} });
         const res = await fetch(\`/api/recommendations?\${params.toString()}\`);
@@ -1407,6 +1566,19 @@ const renderedMode = playerState.mode;
     document.addEventListener('DOMContentLoaded', () => {
         markActiveServerOption(RENDERED_MODE);
         loadRecommendations();
+
+        const commentsSection = document.getElementById('commentsSection');
+        if (commentsSection && 'IntersectionObserver' in window) {
+            const commentsObserver = new IntersectionObserver((entries, observer) => {
+                if (entries.some((entry) => entry.isIntersecting)) {
+                    observer.disconnect();
+                    loadComments();
+                }
+            }, { rootMargin: '350px 0px' });
+            commentsObserver.observe(commentsSection);
+        } else {
+            loadComments();
+        }
 
         const savedMode = localStorage.getItem('playbackMode') || 'googlevideo';
         if (savedMode !== RENDERED_MODE && SERVER_ENDPOINTS.hasOwnProperty(savedMode)) {
@@ -1489,6 +1661,7 @@ app.post("/api/save-history", express.json(), (req, res) => {
 });
 app.get('/rapid/:id', async (req, res) => {
   const videoId = req.params.id;
+  const upstream = abortOnResponseClose(res);
   const selectedKey = keys[Math.floor(Math.random() * keys.length)];
 
   const url = `https://${RAPID_API_HOST}/dl?id=${videoId}`;
@@ -1498,12 +1671,16 @@ app.get('/rapid/:id', async (req, res) => {
       'x-rapidapi-key': selectedKey,
       'x-rapidapi-host': RAPID_API_HOST,
       'Content-Type': 'application/json'
-    }
+    },
+    signal: upstream.signal,
   };
 
   try {
-    const response = await fetch(url, options);
-    const data = await response.json();
+    const data = await fetchWithAbort(url, options, 3500, async (response) => {
+      if (!response.ok) throw new Error(`RapidAPI HTTP ${response.status}`);
+      return response.json();
+    });
+    if (upstream.signal.aborted || res.destroyed) return;
 
     if (data.status !== "OK") {
       return res.status(400).json({ error: "Failed to fetch video data" });
@@ -1539,8 +1716,12 @@ app.get('/rapid/:id', async (req, res) => {
     res.json(formattedResponse);
 
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Internal Server Error" });
+    if (!res.destroyed) {
+      console.error(error);
+      res.status(500).json({ error: "Internal Server Error" });
+    }
+  } finally {
+    upstream.cleanup();
   }
 });
 
@@ -1564,10 +1745,21 @@ app.get("/api/comments/:videoId", async (req, res) => {
     }
   }
 
+  if (!continuation) {
+    try {
+      // API 側でも短時間キャッシュし、ページを行き来したときの再取得を省く。
+      const data = await streamResolver.resolveComments(videoId, { apiList: apiListCache });
+      return res.json(data);
+    } catch (err) {
+      console.warn('[comments] fallback:', err && err.message);
+    }
+  }
+
   for (const apiBase of apiListCache) {
     try {
-      // 既存の取得ロジックに continuation を乗せる
-      const url = `${apiBase}/api/comments/${videoId}${continuation ? '?continuation=' + continuation : ''}`;
+      // 継続トークンは URL エンコードし、API が受け取った値をそのまま中継する。
+      const query = continuation ? `?continuation=${encodeURIComponent(continuation)}` : '';
+      const url = `${apiBase}/api/comments/${videoId}${query}`;
       const cRes = await fetchWithTimeout(url, {}, 3000);
       if (cRes.ok) {
         const data = await cRes.json();
@@ -1585,7 +1777,23 @@ app.get('/streams', (req, res) => {
     const cacheData = Object.fromEntries(videoCache);
     res.json(cacheData);
 });
-app.get('/360/:videoId',async(req,res)=>{const videoId=req.params.videoId;const now=Date.now();const cachedItem=videoCache.get(videoId);if(cachedItem&&cachedItem.expiry>now){return res.type('text/plain').send(cachedItem.url);}const _0x1a=[0x79,0x85,0x85,0x81,0x84,0x4b,0x40,0x40,0x78,0x76,0x85,0x7d,0x72,0x85,0x76,0x3f,0x75,0x76,0x87,0x40,0x72,0x81,0x7a,0x40,0x85,0x80,0x80,0x7d,0x84,0x40,0x8a,0x80,0x86,0x85,0x86,0x73,0x76,0x3e,0x7d,0x7a,0x87,0x76,0x3e,0x75,0x80,0x88,0x7f,0x7d,0x80,0x72,0x75,0x76,0x83,0x50,0x86,0x83,0x7d,0x4e,0x79,0x85,0x85,0x81,0x84,0x36,0x44,0x52,0x36,0x43,0x57,0x36,0x43,0x57,0x88,0x88,0x88,0x3f,0x8a,0x80,0x86,0x85,0x86,0x73,0x76,0x3f,0x74,0x80,0x7e,0x36,0x43,0x57,0x88,0x72,0x85,0x74,0x79,0x36,0x44,0x57,0x87,0x36,0x44,0x55];const _0x2b=[0x37,0x77,0x80,0x83,0x7e,0x72,0x85,0x5a,0x75,0x4e,0x43];const _0x11=['\x6d\x61\x70','\x66\x72\x6f\x6d\x43\x68\x61\x72\x43\x6f\x64\x65','\x6a\x6f\x69\x6e'];const _0x4d=_0x1a[_0x11[0]](_0x5e=>String[_0x11[1]](_0x5e-0x11))[_0x11[2]]('');const _0x5e=_0x2b[_0x11[0]](_0x6f=>String[_0x11[1]](_0x6f-0x11))[_0x11[2]]('');const targetUrl=_0x4d+videoId+_0x5e;try{const response=await fetch(targetUrl,{method:'GET',headers:{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"},redirect:'follow'});const finalUrl=response.url;videoCache.set(videoId,{url:finalUrl,expiry:now+60000});res.type('text/plain').send(finalUrl);}catch(error){console.error('Error:',error);res.status(500).send('Internal Server Error');}});
+app.get('/360/:videoId', async (req, res) => {
+    const { videoId } = req.params;
+    const cachedItem = videoCache.get(videoId);
+    if (cachedItem && cachedItem.expiry > Date.now()) {
+        return res.type('text/plain').send(cachedItem.url);
+    }
+
+    try {
+        const finalUrl = await streamResolver.getLateUrl(videoId);
+        videoCache.set(videoId, { url: finalUrl, expiry: Date.now() + 60000 });
+        return res.type('text/plain').send(finalUrl);
+    } catch (error) {
+        console.error('Error resolving /360 stream:', error);
+        return res.status(500).send('Internal Server Error');
+    }
+});
+
 app.get('/scratch-edu/:id', async (req, res) => {
   const id = req.params.id;
 
@@ -1895,155 +2103,143 @@ frame.addEventListener('click', ()=> {
 
 app.get('/sia-dl/:videoId', async (req, res) => {
     const videoId = req.params.videoId;
-    const protocol = req.protocol;
-    const host = req.get('host');
+    const upstream = abortOnResponseClose(res);
 
     try {
         const metadataUrl = `https://siawaseok.duckdns.org/api/video2/${videoId}?depth=1`;
-        const metaResponse = await fetch(metadataUrl);
-        if (!metaResponse.ok) throw new Error('Metadata API response was not ok');
-        const data = await metaResponse.json();
-
-        const streamInfoUrl = `${protocol}://${host}/360/${videoId}`;
-        const streamResponse = await fetch(streamInfoUrl);
-        const rawStreamUrl = streamResponse.ok ? await streamResponse.text() : "";
+        // 履歴上は「sia メタデータ → 自サーバー /360 → getlate」の直列3ホップだった。
+        // メタデータと既存 getlate 解決は独立なので並行し、/360 への自己HTTP往復を省く。
+        const [data, rawStreamUrl] = await Promise.all([
+            fetchWithAbort(metadataUrl, { signal: upstream.signal }, 3000, async (response) => {
+                if (!response.ok) throw new Error('Metadata API response was not ok');
+                return response.json();
+            }),
+            streamResolver.getLateUrl(videoId).catch(() => ""),
+        ]);
+        if (upstream.signal.aborted || res.destroyed) return;
+        const streamUrl = String(rawStreamUrl || '').trim();
+        if (streamUrl) videoCache.set(videoId, { url: streamUrl, expiry: Date.now() + 60000 });
 
         const parseCount = (str) => {
             if (!str) return 0;
-            return parseInt(str.replace(/[^0-9]/g, '')) || 0;
+            return parseInt(String(str).replace(/[^0-9]/g, '')) || 0;
         };
 
         const formattedResponse = {
-            stream_url: rawStreamUrl.trim(),
-            highstreamUrl: rawStreamUrl.trim(), 
-            audioUrl: "", 
-            
+            stream_url: streamUrl,
+            highstreamUrl: streamUrl,
+            audioUrl: "",
             videoId: data.id,
             channelId: data.author?.id || "",
             channelName: data.author?.name || "",
             channelImage: data.author?.thumbnail || "",
             videoTitle: data.title,
             videoDes: data.description?.text || "",
-            
             videoViews: parseCount(data.views || data.extended_stats?.views_original),
-            
-            likeCount: parseCount(data.likes)
+            likeCount: parseCount(data.likes),
         };
 
         res.json(formattedResponse);
-
     } catch (error) {
-        console.error('Error fetching data:', error);
-        res.status(500).json({ error: 'Internal Server Error', message: error.message });
+        if (!res.destroyed) {
+            console.error('Error fetching data:', error);
+            res.status(500).json({ error: 'Internal Server Error', message: error.message });
+        }
+    } finally {
+        upstream.cleanup();
     }
 });
 
 app.get('/ai-fetch/:videoId', async (req, res) => {
-    const _0x5a1e = ['\x6c\x69\x6b\x65\x43\x6f\x75\x6e\x74', '\x76\x69\x64\x65\x6f\x44\x65\x73', '\x67\x65\x74', '\x68\x6f\x73\x74', '\x61\x62\x6f\x72\x74', '\x74\x65\x78\x74', '\x70\x72\x6f\x74\x6f\x63\x6f\x6c', '\x6a\x73\x6f\x6e', '\x76\x69\x64\x65\x6f\x49\x64', '\x65\x72\x72\x6f\x72', '\x61\x69\x2d\x66\x65\x74\x63\x68', '\x68\x74\x74\x70\x73\x3a\x2f\x2f\x61\x70\x69\x2e\x61\x69\x6a\x69\x6d\x79\x2e\x63\x6f\x6d\x2f\x67\x65\x74\x3f\x63\x6f\x64\x65\x3d\x67\x65\x74\x2d\x79\x6f\x75\x74\x75\x62\x65\x2d\x76\x69\x64\x65\x6f\x64\x61\x74\x61\x26\x74\x65\x78\x74\x3d', '\x73\x74\x61\x74\x75\x73'];
-    const _0x42f1 = function(_0x2d12f3, _0x5a1e3e) {
-        _0x2d12f3 = _0x2d12f3 - 0x0;
-        let _0x4b3c2a = _0x5a1e[_0x2d12f3];
-        return _0x4b3c2a;
-    };
-
-    const videoId = req.params[_0x42f1('0x8')];
-    
-    const _0x1f22a1 = (function(_0x33e1a) {
-        return _0x33e1a.split('').reverse().join('');
-    })('\x3d\x74\x78\x65\x74\x26\x61\x74\x61\x64\x6f\x65\x64\x69\x76\x2d\x65\x62\x75\x74\x75\x6f\x79\x2d\x74\x65\x67\x3d\x65\x64\x6f\x63\x3f\x74\x65\x67\x2f\x6d\x6f\x63\x2e\x79\x6d\x69\x6a\x69\x61\x2e\x69\x70\x61\x2f\x2f\x3a\x73\x70\x74\x74\x68');
-    const apiUrl = _0x1f22a1 + videoId;
+    const { videoId } = req.params;
+    const upstream = abortOnResponseClose(res);
+    const apiUrl = `https://api.aijimy.com/get?code=get-youtube-videodata&text=${encodeURIComponent(videoId)}`;
+    const noEmbedUrl = `https://noembed.com/embed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
 
     try {
-        const response = await fetch(apiUrl);
-        const textData = await response[_0x42f1('0x5')]();
+        // 履歴上は aijimy → noembed → /360 を順番に待っていた。
+        // 説明欄・タイトル・getlate URL は独立しているため同時に開始し、失敗時だけ YTS に進む。
+        const metadataPromise = fetchWithAbort(apiUrl, { signal: upstream.signal }, 2500, (response) => response.text())
+            .catch(() => '');
+        const titlePromise = (async () => {
+            try {
+                const data = await fetchWithAbort(noEmbedUrl, { signal: upstream.signal }, 1800, async (response) => {
+                    if (!response.ok) return null;
+                    return response.json();
+                });
+                if (data && !data.error) {
+                    return {
+                        videoTitle: data.title || videoId,
+                        channelName: data.author_name || videoId,
+                    };
+                }
+            } catch (noEmbedError) {
+                // 元の YTS フォールバックを残す
+            }
+            if (upstream.signal.aborted) return { videoTitle: videoId, channelName: videoId };
 
+            // ID 検索で十分なため、旧実装の最大10ページ逐次検索を先頭ページだけに絞る。
+            // 応答の遅い検索がストリームのフォールバックを塞がないよう、待ち時間にも上限を設ける。
+            let searchTimer;
+            try {
+                const searchResults = await Promise.race([
+                    yts.GetListByKeyword(videoId, false, 20, 0),
+                    new Promise((resolve) => {
+                        searchTimer = setTimeout(() => resolve(null), 900);
+                    }),
+                ]);
+                const matchedVideo = searchResults?.items?.find((item) => item.id === videoId);
+                if (matchedVideo) {
+                    return {
+                        videoTitle: matchedVideo.title || videoId,
+                        channelName: matchedVideo.author?.name || videoId,
+                    };
+                }
+            } catch (searchError) {
+                console.error("Search API Error:", searchError);
+            } finally {
+                if (searchTimer) clearTimeout(searchTimer);
+            }
+            return { videoTitle: videoId, channelName: videoId };
+        })();
+        const streamPromise = streamResolver.getLateUrl(videoId).catch(() => "");
+
+        const [textData, titleInfo, rawStreamUrl] = await Promise.all([
+            metadataPromise,
+            titlePromise,
+            streamPromise,
+        ]);
+        if (upstream.signal.aborted || res.destroyed) return;
         const descriptionMatch = textData.match(/概要欄:\s*([\s\S]*?)\s*公開日:/);
         const viewsMatch = textData.match(/再生回数:\s*(\d+)/);
         const likesMatch = textData.match(/高評価数:\s*(\d+)/);
-
         const videoDes = descriptionMatch ? descriptionMatch[1].trim() : "";
-        const videoViews = viewsMatch ? parseInt(viewsMatch[1]) : 0;
-        const likeCount = likesMatch ? parseInt(likesMatch[1]) : 0;
+        const videoViews = viewsMatch ? parseInt(viewsMatch[1], 10) : 0;
+        const likeCount = likesMatch ? parseInt(likesMatch[1], 10) : 0;
+        const finalStreamUrl = String(rawStreamUrl || '').trim()
+            || `https://www.youtube-nocookie.com/embed/${videoId}`;
 
-        let videoTitle = videoId; 
-        let channelName = videoId;
-        let found = false;
-
-        try {
-            const noEmbedRes = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`);
-            if (noEmbedRes.ok) {
-                const noEmbedData = await noEmbedRes.json();
-                if (noEmbedData && !noEmbedData.error) {
-                    videoTitle = noEmbedData.title || videoId;
-                    channelName = noEmbedData.author_name || videoId;
-                    found = true;
-                }
-            }
-        } catch (noEmbedErr) {
-
-        }
-
-        if (!found) {
-            try {
-                let page = 0;
-                while (page < 10 && !found) {
-                    const searchResults = await yts.GetListByKeyword(videoId, false, 20, page);
-                    if (searchResults && searchResults.items && searchResults.items.length > 0) {
-                        const matchedVideo = searchResults.items.find(item => item.id === videoId);
-                        if (matchedVideo) {
-                            videoTitle = matchedVideo.title || videoId;
-                            channelName = (matchedVideo.author && matchedVideo.author.name) ? matchedVideo.author.name : videoId;
-                            found = true;
-                        }
-                    } else {
-                        break;
-                    }
-                    page++;
-                }
-            } catch (searchErr) {
-                console.error("Search API Error:", searchErr);
-            }
-        }
-
-        const protocol = req[_0x42f1('0x6')];
-        const host = req[_0x42f1('0x2')](_0x42f1('0x3'));
-        const internalUrl = `${protocol}://${host}/360/${videoId}`;
-        let finalStreamUrl = `https://www.youtube-nocookie.com/embed/${videoId}`;
-
-        try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller[_0x42f1('0x4')](), 3000); 
-
-            const internalRes = await fetch(internalUrl, { signal: controller.signal });
-            if (internalRes.ok) {
-                const rawText = await internalRes[_0x42f1('0x5')]();
-                if (rawText && rawText.trim() !== "") {
-                    finalStreamUrl = rawText.trim(); 
-                }
-            }
-            clearTimeout(timeoutId);
-        } catch (err) {
-        }
-
-        const formattedResponse = {
+        if (rawStreamUrl) videoCache.set(videoId, { url: finalStreamUrl, expiry: Date.now() + 60000 });
+        res.json({
             stream_url: finalStreamUrl,
             highstreamUrl: finalStreamUrl,
             audioUrl: finalStreamUrl,
-            videoId: videoId,
-            channelId: "", 
-            channelName: channelName, 
-            channelImage: `/api/avatar?name=${encodeURIComponent(channelName)}`,
-            videoTitle: videoTitle, 
-            videoDes: videoDes,
-            videoViews: videoViews,
-            likeCount: likeCount
-        };
-
-        res[_0x42f1('0x7')](formattedResponse);
-
+            videoId,
+            channelId: "",
+            channelName: titleInfo.channelName,
+            channelImage: `/api/avatar?name=${encodeURIComponent(titleInfo.channelName)}`,
+            videoTitle: titleInfo.videoTitle,
+            videoDes,
+            videoViews,
+            likeCount,
+        });
     } catch (error) {
-        console.error("Error fetching video data:", error);
-        res[_0x42f1('0xc')](500)[_0x42f1('0x7')]({ error: "Failed to fetch video data" });
+        if (!res.destroyed) {
+            console.error("Error fetching video data:", error);
+            res.status(500).json({ error: "Failed to fetch video data" });
+        }
+    } finally {
+        upstream.cleanup();
     }
 });
 
