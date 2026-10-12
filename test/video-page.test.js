@@ -53,6 +53,8 @@ test.before(async () => {
       ...process.env,
       PORT: String(APP_PORT),
       MIN_TUBE_API_LIST: `http://127.0.0.1:${MOCK_PORT}/min-tube-api.json`,
+      YT_META: '0',
+      YT_LEGACY_TIMEOUT: '300',
       NODE_ENV: 'test',
     },
     stdio: 'ignore',
@@ -63,6 +65,29 @@ test.before(async () => {
 test.after(() => {
   if (app) app.kill();
   if (mock) mock.kill();
+});
+
+test('遅いコメント取得を待たずに動画ページを返し、コメントは後から取得できる', async () => {
+  const startedAt = Date.now();
+  const pageRes = await get(`/video/${VIDEO_ID}`);
+  const elapsed = Date.now() - startedAt;
+  const html = await pageRes.text();
+
+  assert.equal(pageRes.status, 200);
+  assert.ok(elapsed < 800, `コメントAPI(モックでは900ms)を待たずに返るべき: ${elapsed}ms`);
+  assert.match(html, /コメントを読み込み中/);
+  assert.match(html, /fetch\(commentsEndpoint/);
+
+  const commentsRes = await get(`/api/comments/${VIDEO_ID}`);
+  assert.equal(commentsRes.status, 200);
+  const comments = await commentsRes.json();
+  assert.equal(comments.commentCount, 2);
+  assert.equal(comments.comments[0].content, 'b');
+
+  const cachedStartedAt = Date.now();
+  const cachedRes = await get(`/api/comments/${VIDEO_ID}`);
+  await cachedRes.json();
+  assert.ok(Date.now() - cachedStartedAt < 250, '再訪時はコメントキャッシュから返る');
 });
 
 test('人間確認の cookie が無くても動画ページが開く', async () => {
