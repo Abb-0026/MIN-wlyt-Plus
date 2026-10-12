@@ -35,14 +35,33 @@ afterEach(() => {
   for (const t of hangTimers) clearTimeout(t);
   hangTimers.clear();
 });
-const jsonResponse = (body, ms) =>
-  sleep(ms).then(() => ({ ok: true, status: 200, json: async () => body }));
+const jsonResponse = (body, ms, signal, onAbort) => new Promise((resolve, reject) => {
+  if (signal?.aborted) return reject(new Error('aborted'));
+  const cleanup = () => signal?.removeEventListener('abort', abort);
+  const timer = setTimeout(() => {
+    cleanup();
+    resolve({ ok: true, status: 200, json: async () => body });
+  }, ms);
+  const abort = () => {
+    clearTimeout(timer);
+    cleanup();
+    onAbort?.();
+    reject(new Error('aborted'));
+  };
+  signal?.addEventListener('abort', abort, { once: true });
+});
 
-function makeFetch({ fail = new Set() } = {}) {
+function makeFetch({ fail = new Set(), latency = {} } = {}) {
   const fetchImpl = async (url, options = {}) => {
     if (typeof url !== 'string') throw new Error('unexpected url');
-    // 呼び出し回数を記録（下位ティアを無駄に呼んでいないかの検証用）
+    // 呼び出し回数とキャンセルを記録（重複・不要な上流アクセスの回帰検証用）
     const count = (name) => fetchImpl.calls.set(name, (fetchImpl.calls.get(name) || 0) + 1);
+    const response = (name, body, defaultLatency) => jsonResponse(
+      body,
+      latency[name] ?? defaultLatency,
+      options.signal,
+      () => fetchImpl.aborts.set(name, (fetchImpl.aborts.get(name) || 0) + 1)
+    );
     if (url.includes('/sia-dl/')) count('sia-dl');
     if (url.includes('/ai-fetch/')) count('ai-fetch');
     if (url.includes('/rapid/')) count('rapid');
@@ -52,31 +71,29 @@ function makeFetch({ fail = new Set() } = {}) {
     if (url.includes('/api/video/')) {
       const name = url.includes('/fast') ? 'min-tube:fast' : 'min-tube:slow';
       if (fail.has(name)) throw new Error(`${name} failed`);
-      return jsonResponse(
-        { stream_url: `https://googlevideo.example/${name}`, videoTitle: 'mock' },
-        LATENCY[name]
-      );
+      return response(name, { stream_url: `https://googlevideo.example/${name}`, videoTitle: 'mock' }, LATENCY[name]);
     }
     if (url.includes('/api/comments/')) {
       if (fail.has('comments')) return hang().then(() => { throw new Error('hang'); });
-      return jsonResponse({ commentCount: 2, comments: [{ author: 'a', content: 'b' }] }, LATENCY.comments);
+      return response('comments', { commentCount: 2, comments: [{ author: 'a', content: 'b' }] }, LATENCY.comments);
     }
     if (url.includes('/sia-dl/')) {
       if (fail.has('sia-dl')) throw new Error('sia-dl failed');
-      return jsonResponse({ stream_url: 'https://googlevideo.example/sia' }, LATENCY['sia-dl']);
+      return response('sia-dl', { stream_url: 'https://googlevideo.example/sia' }, LATENCY['sia-dl']);
     }
     if (url.includes('/ai-fetch/')) {
       if (fail.has('ai-fetch')) throw new Error('ai-fetch failed');
       // 旧実装の既定値どおり、失敗時は埋め込みURLを返す
-      return jsonResponse({ stream_url: 'https://www.youtube-nocookie.com/embed/mock' }, LATENCY['ai-fetch']);
+      return response('ai-fetch', { stream_url: 'https://www.youtube-nocookie.com/embed/mock' }, LATENCY['ai-fetch']);
     }
     if (url.includes('/rapid/')) {
       if (fail.has('rapid')) throw new Error('rapid failed');
-      return jsonResponse({ stream_url: 'https://googlevideo.example/rapid' }, LATENCY.rapid);
+      return response('rapid', { stream_url: 'https://googlevideo.example/rapid' }, LATENCY.rapid);
     }
     throw new Error(`unknown url: ${url}`);
   };
   fetchImpl.calls = new Map();
+  fetchImpl.aborts = new Map();
   return fetchImpl;
 }
 
@@ -149,6 +166,53 @@ test('最速の取得元が勝ち、遅い取得元を待たない', async () =>
   await new Promise((r) => setTimeout(r, 1200)); // ヘッジが発動しないことを確認する
   assert.equal(fetchImpl.calls.get('rapid'), undefined, 'RapidAPI は無駄に呼ばない');
   assert.equal(fetchImpl.calls.get('ai-fetch'), undefined, 'ai-fetch は無駄に呼ばない');
+  assert.equal(fetchImpl.aborts.get('min-tube:slow'), 1, '負けた遅い Min-Tube API を中断する');
+  assert.equal(fetchImpl.aborts.get('sia-dl'), 1, '負けた sia-dl を中断する');
+});
+
+test('起動済み RapidAPI が遅い主系より先に成功したら、その結果で即返す', async () => {
+  const fetchImpl = makeFetch({
+    fail: new Set(['sia-dl']),
+    latency: { 'min-tube:fast': 2400, 'min-tube:slow': 2400 },
+  });
+  const resolver = new StreamResolver({ fetchImpl, deadline: 6000 });
+  const started = Date.now();
+  const result = await resolver.resolve('rapidwins000', { apiList: API_LIST, baseUrl: BASE });
+  const elapsed = Date.now() - started;
+
+  assert.equal(result.provider, 'rapid');
+  assert.ok(elapsed < 1900, `Rapid の成功後は遅い主系を待たない: ${elapsed}ms`);
+  assert.equal(fetchImpl.aborts.get('min-tube:fast'), 1);
+  assert.equal(fetchImpl.aborts.get('min-tube:slow'), 1);
+});
+
+test('同じ動画への同時アクセスは一つのプロバイダーレースに集約される', async () => {
+  const fetchImpl = makeFetch();
+  const resolver = new StreamResolver({ fetchImpl, deadline: 6000 });
+  const [first, second] = await Promise.all([
+    resolver.resolve('singleflight1', { apiList: API_LIST, baseUrl: BASE }),
+    resolver.resolve('singleflight1', { apiList: API_LIST, baseUrl: BASE }),
+  ]);
+
+  assert.equal(first.provider, second.provider);
+  assert.equal(fetchImpl.calls.get('video'), 2, 'Min-Tube API 2台分のみ開始');
+  assert.equal(fetchImpl.calls.get('sia-dl'), 1, 'sia-dl は重複起動しない');
+  assert.equal(resolver.stats.inflightHits, 1);
+});
+
+test('Min-Tube API 一覧の重複・末尾スラッシュを正規化する', () => {
+  const resolver = new StreamResolver({ fetchImpl: makeFetch() });
+  const providers = resolver.providers('abcdefghijk', {
+    apiList: ['http://api.test/fast/', 'http://api.test/fast', 'http://api.test/slow', null],
+    baseUrl: 'http://app.test/',
+  });
+  const apiProviders = providers.filter((provider) => provider.name.startsWith('min-tube:'));
+
+  assert.deepEqual(apiProviders.map((provider) => provider.url), [
+    'http://api.test/fast/api/video/abcdefghijk',
+    'http://api.test/slow/api/video/abcdefghijk',
+  ]);
+  assert.equal(providers.find((provider) => provider.name === 'sia-dl').url, 'http://app.test/sia-dl/abcdefghijk');
 });
 
 test('上位ティアが遅い/失敗したときだけ予備(rapid, ai-fetch)を走らせる', async () => {
@@ -171,6 +235,55 @@ test('2回目はキャッシュから即座に返る（ページの行き来が�
   assert.equal(second.cached, true);
   assert.ok(elapsed < 50, `キャッシュなら一瞬で返るべき: ${elapsed}ms`);
   assert.equal(resolver.stats.hits, 1);
+});
+
+test('getlate URL は同時要求をまとめ、短期キャッシュから返す', async () => {
+  let calls = 0;
+  let bodyDestroyed = 0;
+  const fetchImpl = async (url, options = {}) => {
+    calls += 1;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, 30);
+      options.signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(new Error('aborted'));
+      }, { once: true });
+    });
+    return {
+      ok: true,
+      status: 200,
+      url: 'https://googlevideo.example/cached',
+      body: { destroy: () => { bodyDestroyed += 1; } },
+    };
+  };
+  const resolver = new StreamResolver({ fetchImpl });
+  const [first, second] = await Promise.all([
+    resolver.getLateUrl('latecache001'),
+    resolver.getLateUrl('latecache001'),
+  ]);
+  const cached = await resolver.getLateUrl('latecache001');
+
+  assert.equal(first, 'https://googlevideo.example/cached');
+  assert.equal(second, first);
+  assert.equal(cached, first);
+  assert.equal(calls, 1, '同時要求と再要求を一つの getlate 呼び出しに集約');
+  assert.equal(bodyDestroyed, 1, 'URL取得後に不要な動画レスポンス本文を閉じる');
+});
+
+test('getlate が応答しない場合は自身のタイムアウトで中断する', async () => {
+  let aborted = false;
+  const resolver = new StreamResolver({
+    fetchImpl: (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        aborted = true;
+        reject(new Error('aborted'));
+      }, { once: true });
+    }),
+    lateTimeout: 20,
+  });
+
+  await assert.rejects(resolver.getLateUrl('latehang000'), /aborted/);
+  assert.equal(aborted, true);
 });
 
 test('上位ティアが全滅しても最終手段(ai-fetch)でページは成立する', async () => {

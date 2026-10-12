@@ -33,6 +33,13 @@ test('PWA starts at the routed application hub', () => {
   assert.ok(fs.existsSync(path.join(root, 'public', 'min-tube-pro.html')));
 });
 
+test('home feed starts at DOMContentLoaded instead of waiting for every asset', () => {
+  const home = read('public/home.html');
+  assert.match(home, /document\.addEventListener\('DOMContentLoaded', initializeHomeFeed/);
+  assert.match(home, /document\.addEventListener\('DOMContentLoaded', runHomePromotionOnce/);
+  assert.doesNotMatch(home, /window\.onload/);
+});
+
 test('manifest, service worker, and icons map to files that exist', () => {
   const routes = [
     { route: '/manifest.json', file: 'manifest.json', pattern: /app\.get\("\/manifest\.json"[\s\S]*?path\.join\(__dirname,\s*"manifest\.json"\)/ },
@@ -125,6 +132,37 @@ test('proxy handling stays opt-out and keeps the manual override', () => {
   assert.doesNotMatch(tunnel, /require\(['"]undici['"]\)/);
   assert.doesNotMatch(tunnel, /require\(['"]https-proxy-agent['"]\)/);
   assert.doesNotMatch(tunnel, /require\(['"]socks-proxy-agent['"]\)/);
+});
+
+test('既存4方式を維持し、履歴で見つかった直列ホップと不要な待ちを削る', () => {
+  const resolver = read('lib/stream-resolver.js');
+  const routeBlock = (start, end) => {
+    const from = index.indexOf(start);
+    assert.notEqual(from, -1, `${start} route exists`);
+    const to = index.indexOf(end, from);
+    return index.slice(from, to === -1 ? undefined : to);
+  };
+
+  const sia = routeBlock("app.get('/sia-dl/:videoId'", "app.get('/ai-fetch/:videoId'");
+  const ai = routeBlock("app.get('/ai-fetch/:videoId'", 'app.get("/youtube-pro"');
+  const rapid = routeBlock("app.get('/rapid/:id'", "app.get('/streams'");
+
+  assert.match(resolver, /name: `min-tube:/, 'Min-Tube API 経路を維持');
+  assert.match(sia, /Promise\.all/, 'Sia メタデータとストリームを並列取得');
+  assert.match(sia, /streamResolver\.getLateUrl\(videoId\)/, '既存 getlate キャッシュを再利用');
+  assert.doesNotMatch(sia, /\/360\//, 'Sia の自サーバーへの往復を除去');
+  assert.match(rapid, /fetchWithAbort\(/, 'RapidAPI 上流を時間切れ時に中断');
+  assert.match(index, /function abortOnResponseClose\(/, '勝者決定後の切断を個別の上流にも伝える');
+  assert.match(sia, /abortOnResponseClose\(res\)/);
+  assert.match(rapid, /abortOnResponseClose\(res\)/);
+  assert.match(ai, /abortOnResponseClose\(res\)/);
+  assert.match(ai, /Promise\.all/, 'AI メタデータ・タイトル・ストリームを並列取得');
+  assert.match(ai, /streamResolver\.getLateUrl\(videoId\)/, 'AI 経路も同じ getlate 解決を再利用');
+  assert.doesNotMatch(ai, /\/360\//, 'AI 経路も自サーバーへの往復を除去');
+  assert.match(ai, /GetListByKeyword\(videoId, false, 20, 0\)/, 'YTS の既存補助情報は残し、10ページ逐次検索を避ける');
+  assert.match(resolver, /fastFallback: true/, '起動済み Rapid の成功は遅い主系を待たず採用');
+  assert.match(resolver, /controller\.abort\(\)/, 'レース敗者の上流リクエストを中断');
+  assert.match(resolver, /this\.inflight = new Map\(\)/, '同一動画の同時要求を集約');
 });
 
 test('service worker only precaches valid app-shell paths', () => {

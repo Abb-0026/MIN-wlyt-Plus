@@ -2273,7 +2273,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
     // パーソナライズモードかどうか
     let isPersonalized = true;
 
-    window.onload = () => {
+    const initializeHomeFeed = () => {
       filtersFromUrl();
       setupFilterBar();
       const params = new URLSearchParams(window.location.search);
@@ -2288,6 +2288,13 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
         loadPersonalizedFeed(0);
       }
     };
+
+    // 外部フォントなど全リソースの読み込み完了を待たず、DOM解析直後にフィードを開始する。
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initializeHomeFeed, { once: true });
+    } else {
+      initializeHomeFeed();
+    }
 
     // ===== LIBRARY: History / Liked / Playlists =====
     const LIB_HISTORY  = 'mt_history';
@@ -2646,12 +2653,12 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       }, 1500);
     }
 
-    // 既存の window.onload もしくは最後に追記
-    const originalOnload = window.onload;
-    window.onload = () => {
-      if (originalOnload) originalOnload();
-      runHomePromotionOnce(); // 1回目だけ実行
-    };
+    // プロモーションも DOM 準備後に開始し、外部リソースの完了待ちを避ける。
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', runHomePromotionOnce, { once: true });
+    } else {
+      runHomePromotionOnce();
+    }
 
         // ── Service Worker ──
     if ('serviceWorker' in navigator) {
