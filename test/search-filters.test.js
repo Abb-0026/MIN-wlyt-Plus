@@ -93,10 +93,12 @@ test('/api/search は絞り込みを受け取って sp にする', () => {
   const block = indexSrc.slice(indexSrc.indexOf('app.get("/api/search"'), indexSrc.indexOf('app.get("/api/1-search"'));
   assert.match(block, /filtersFromQuery\(req\.query\)/, 'クエリから条件を取り出す');
   assert.match(block, /buildSearchParams\(filters\)/, 'sp を作る');
-  assert.match(block, /ytMeta\.search\(query, \{ page, sp: sp \|\| undefined \}\)/, 'sp を渡す');
+  assert.match(block, /searchResolver\.search\(query, \{ page, sp \}\)/, 'sp を渡す');
+  assert.match(indexSrc, /ytMeta\.search\(query, \{ page, sp \}\)/, 'InnerTube へ sp を渡す');
   // 絞り込みで0件でも「何も出ない」にしない
   assert.match(block, /filterApplied/, '絞り込みが効いたかを返す');
-  assert.match(block, /ytMeta\.search\(query, \{ page \}\)/, '駄目なら絞り込みなしで再検索する');
+  const resolver = indexSrc.slice(indexSrc.indexOf('/* SEARCH_ONLY_BEGIN */'), indexSrc.indexOf('/* SEARCH_ONLY_END */'));
+  assert.match(resolver, /primary\('', budget\(this\.retryTimeout\)\)/, '駄目なら絞り込みなしで再検索する');
 });
 
 test('フロントの一覧はサーバの CHOICES と一致している', () => {
@@ -128,9 +130,10 @@ test('検索のURLは絞り込みを付け忘れない', () => {
     homeSrc.indexOf('async function loadContent'),
     homeSrc.indexOf('async function loadPersonalizedFeed'));
   assert.ok(loadContent.length > 100, 'loadContent が見つかる');
-  // 本検索とショートの追加取得は searchEndpoint() に集約する
+  // 本検索は searchEndpoint() に集約する。Shorts のためだけの先読みはしない。
   assert.match(loadContent, /searchEndpoint\(query, page\)/);
-  assert.match(loadContent, /searchEndpoint\(currentQuery, p\)/);
+  assert.doesNotMatch(loadContent, /searchEndpoint\(currentQuery, p\)/);
+  assert.match(loadContent, /page === 0 && isDefault && items\.length < 12/, '別カテゴリによる補充はホームだけ');
   // 残ってよいのは「別カテゴリで補充する」1か所だけ（別のクエリなので絞り込みは付けない）
   const inline = loadContent.match(/\/api\/search\?q=/g) || [];
   assert.strictEqual(inline.length, 1, 'loadContent 内で直接 /api/search を書いてよいのは補充の1か所だけ');
@@ -157,4 +160,9 @@ test('/search を再読み込みしても 404 にならない', () => {
   assert.match(indexSrc, /app\.get\("\/", serveHome\)/, '/ と同じページを返す');
   const block = indexSrc.slice(indexSrc.indexOf('const serveHome'), indexSrc.indexOf('app.get("/api/trending"'));
   assert.match(block, /home\.html/, 'ホームを返す');
+});
+
+test('クエリの不明な条件・配列・オブジェクトを既定値に正規化する', () => {
+  assert.deepStrictEqual(filtersFromQuery({ sort: 'bad', date: ['today'], type: {}, duration: '__proto__' }),
+    { sort: 'relevance', uploadDate: '', type: '', duration: '' });
 });
