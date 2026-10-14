@@ -502,6 +502,435 @@ async function fastMeta(name, attempt, fallback, { timeout = 3500 } = {}) {
   }
 }
 
+/* SEARCH_ONLY_BEGIN */
+// 検索専用の取得処理を既存ファイル内に閉じ込める。再生等のAPIには流用しない。
+const { WistaSearch, SearchResolver } = (() => {
+  const { TtlCache } = require("./lib/ttl-cache");
+  /**
+   * Wista の「キーワード検索だけ」を利用するアダプタ。
+   * apiListCache / StreamResolver には登録しない。上流へのパスは /api/search に固定。
+   */
+
+  const DEFAULT_SEARCH_BASES = Object.freeze([
+    'https://wista-yt-api-ls13.onrender.com',
+    'https://wista-yt-api-vdjb.onrender.com',
+    'https://wista-yt-api-n85t.onrender.com',
+    'https://wista-yt-api-0jl8.onrender.com',
+    'https://wista-yt-api.onrender.com',
+  ]);
+  const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
+
+  function text(value) {
+    if (typeof value === 'string' || typeof value === 'number') return String(value);
+    if (!value || typeof value !== 'object') return '';
+    for (const key of ['text', 'simpleText', 'content']) {
+      if (typeof value[key] === 'string') return value[key];
+    }
+    return Array.isArray(value.runs) ? value.runs.map((run) => text(run && run.text)).join('') : '';
+  }
+
+  function httpUrl(value) {
+    if (typeof value !== 'string') return '';
+    try {
+      const url = new URL(value.startsWith('//') ? `https:${value}` : value);
+      return /^https?:$/.test(url.protocol) && !url.username && !url.password ? url.href : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function thumbnails(value) {
+    const list = Array.isArray(value) ? value : (value && value.thumbnails) || [];
+    if (!Array.isArray(list)) return [];
+    return list.map((thumb) => ({
+      url: httpUrl(thumb && thumb.url),
+      width: Math.max(0, Number(thumb && thumb.width) || 0),
+      height: Math.max(0, Number(thumb && thumb.height) || 0),
+    })).filter((thumb) => thumb.url).sort((a, b) => b.width - a.width);
+  }
+
+  function durationText(value) {
+    const label = text(value);
+    if (label) return label;
+    const seconds = value && value.seconds;
+    if (!Number.isFinite(seconds) || seconds < 0) return '';
+    const n = Math.floor(seconds);
+    const mmss = `${Math.floor(n / 60) % 60}:${String(n % 60).padStart(2, '0')}`;
+    return n >= 3600 ? `${Math.floor(n / 3600)}:${mmss.padStart(5, '0')}` : `${Math.floor(n / 60)}:${String(n % 60).padStart(2, '0')}`;
+  }
+
+  /** youtubei.js の Text / Author / Duration を既存カードのフィールドに合わせる。 */
+  function normalizeWistaItems(videos) {
+    if (!Array.isArray(videos)) return [];
+    const seen = new Set();
+    const items = [];
+    for (const video of videos) {
+      if (!video || typeof video !== 'object') continue;
+      const kind = String(video.type || 'video').toLowerCase();
+      const shortKinds = ['short', 'shorts', 'reelitem', 'shortslockupview'];
+      if (!['video', 'compactvideo', 'gridvideo', ...shortKinds].includes(kind)) continue;
+      // ShortsLockupView は直下に id / title を持たない。検索応答に含まれる
+      // videoId と表示用メタデータだけを読み、endpoint 自体を呼ぶことはしない。
+      const payload = (video.on_tap_endpoint && video.on_tap_endpoint.payload)
+        || (video.inline_player_data && video.inline_player_data.payload) || {};
+      const entityId = typeof video.entity_id === 'string' && video.entity_id.startsWith('shorts-shelf-item-')
+        ? video.entity_id.slice('shorts-shelf-item-'.length) : '';
+      const id = video.id || video.videoId || video.video_id || payload.videoId || entityId;
+      if (typeof id !== 'string' || !VIDEO_ID.test(id) || seen.has(id)) continue;
+      seen.add(id);
+      const overlay = video.overlay_metadata || {};
+      const author = video.author || {};
+      const avatar = thumbnails(author.thumbnails || video.channelThumbnail);
+      let thumb = thumbnails(video.thumbnails || video.thumbnail);
+      if (!thumb.length) thumb = thumbnails(payload.thumbnail);
+      const isLive = video.is_live === true || video.isLive === true
+        || (Array.isArray(video.badges) && video.badges.some((badge) => /LIVE_NOW/.test(String(badge && badge.style))));
+      // ホワイトリスト方式。上流に含まれる endpoint / 再生関連URL は結果に持ち込まない。
+      items.push({
+        id,
+        type: 'video',
+        title: text(video.title) || text(overlay.primary_text),
+        channelTitle: text(author.name) || text(video.channelTitle),
+        channelId: text(author.id) || text(video.channelId),
+        channelThumbnail: avatar.length ? avatar[0].url : httpUrl(video.channelThumbnail),
+        thumbnail: { thumbnails: thumb.length ? thumb : [{ url: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, width: 480, height: 360 }] },
+        lengthText: isLive ? 'ライブ' : durationText(video.duration || video.lengthText || video.length),
+        viewCountText: text(video.view_count) || text(video.viewCountText) || text(video.short_view_count) || text(overlay.secondary_text),
+        publishedTimeText: text(video.published) || text(video.publishedTimeText),
+        isLive,
+        isShort: shortKinds.includes(kind),
+      });
+      if (items.length >= 60) break;
+    }
+    return items;
+  }
+
+  function searchBases(value) {
+    const list = typeof value === 'string' ? value.split(',') : value;
+    return [...new Set((Array.isArray(list) ? list : DEFAULT_SEARCH_BASES).map((base) => {
+      try {
+        const url = new URL(String(base).trim());
+        // 管理者指定の HTTP はローカルのモック／セルフホスト検証にも使える。
+        if (!/^https?:$/.test(url.protocol) || url.username || url.password) return '';
+        return url.origin;
+      } catch (_) {
+        return '';
+      }
+    }).filter(Boolean))];
+  }
+
+  const emptyResult = (failed = false) => ({ items: [], hasMore: false, nextPage: null, failed });
+
+  class WistaSearch {
+    constructor({ fetchImpl = globalThis.fetch, bases, enabled = true, timeout = 2500, deadline = 4500,
+      hedgeMs = 250, cooldown = 30000, ttl = 10 * 60 * 1000, max = 300, now = () => Date.now() } = {}) {
+      this.fetchImpl = fetchImpl;
+      this.enabled = enabled;
+      this.timeout = timeout;
+      this.deadline = deadline;
+      this.hedgeMs = hedgeMs;
+      this.cooldown = cooldown;
+      this.now = now;
+      this.hosts = searchBases(bases).map((base) => ({ base, failures: 0, retryAt: 0 }));
+      this.cursor = 0;
+      this.cache = new TtlCache({ max, ttl, now });
+      this.emptyCache = new TtlCache({ max: 100, ttl: 10000, now });
+    }
+
+    /** アプリの page は 0 始まり。Wista へ送る page は 1 始まり。 */
+    async search(query, { page = 0 } = {}) {
+      const q = typeof query === 'string' ? query.trim() : '';
+      if (!this.enabled || !q || !Number.isSafeInteger(page) || page < 0 || page > 100) return emptyResult();
+      const key = JSON.stringify([q, page]);
+      const empty = this.emptyCache.get(key);
+      if (empty) return empty;
+      const result = await this.cache.wrap(key, undefined, async () => {
+        const out = await this._race(q, page);
+        if (out.items.length) return out;
+        // 正常な0件だけ短く記憶する。障害を「検索0件」として長期キャッシュしない。
+        if (!out.failed) this.emptyCache.set(key, out);
+        return null;
+      });
+      return result || this.emptyCache.get(key) || emptyResult(true);
+    }
+
+    async _request(host, query, page, signal) {
+      const url = new URL('/api/search', host.base);
+      url.searchParams.set('q', query);
+      url.searchParams.set('page', String(page + 1));
+      const controller = new AbortController();
+      let rejectAborted;
+      const onAbort = () => {
+        const error = new Error('Wista search aborted or timed out');
+        error.name = 'AbortError';
+        rejectAborted(error);
+      };
+      const aborted = new Promise((_, reject) => { rejectAborted = reject; });
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+      const fromParent = () => controller.abort();
+      signal.addEventListener('abort', fromParent, { once: true });
+      const timer = setTimeout(() => controller.abort(), this.timeout);
+      if (signal.aborted) controller.abort();
+      try {
+        // timeout はヘッダー到着だけでなく JSON 本文の読み取りまで含む。
+        const job = (async () => {
+          const response = await this.fetchImpl(url.href, {
+            method: 'GET', headers: { Accept: 'application/json' },
+            signal: controller.signal, redirect: 'error', size: 4 * 1024 * 1024,
+          });
+          if (!response || !response.ok) throw new Error(`Wista search HTTP ${response && response.status}`);
+          const data = await response.json();
+          if (!data || data.error || !Array.isArray(data.videos)) throw new Error('Invalid Wista search JSON');
+          const items = normalizeWistaItems(data.videos);
+          if (data.videos.length && !items.length) throw new Error('Unrecognized Wista video items');
+          const next = Number(data.nextPageToken);
+          const hasToken = Object.prototype.hasOwnProperty.call(data, 'nextPageToken');
+          const hasMore = items.length > 0 && (hasToken
+            ? Number.isSafeInteger(next) && next > page + 1 && next <= 101
+            : page < 100);
+          return { items, hasMore, nextPage: hasMore ? (hasToken ? next - 1 : page + 1) : null, failed: false };
+        })();
+        return await Promise.race([job, aborted]);
+      } finally {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', fromParent);
+        controller.signal.removeEventListener('abort', onAbort);
+      }
+    }
+
+    /** 最初は1台、遅ければ2台まで並走。失敗時は残りへ進み、勝者決定時は敗者を中断。 */
+    _race(query, page) {
+      const ordered = this.hosts.slice(this.cursor).concat(this.hosts.slice(0, this.cursor));
+      this.cursor = (this.cursor + 1) % Math.max(1, this.hosts.length);
+      const candidates = ordered.filter((host) => host.retryAt <= this.now());
+      if (!candidates.length) return Promise.resolve(emptyResult(true));
+
+      return new Promise((resolve) => {
+        const controller = new AbortController();
+        let settled = false;
+        let active = 0;
+        let index = 0;
+        let width = 1;
+        let empty = null;
+        let hedgeTimer;
+        let deadlineTimer;
+        const finish = (result) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(hedgeTimer);
+          clearTimeout(deadlineTimer);
+          controller.abort();
+          resolve(result);
+        };
+        const fill = () => {
+          while (!settled && active < width && index < candidates.length) {
+            const host = candidates[index++];
+            active += 1;
+            this._request(host, query, page, controller.signal).then((out) => {
+              if (settled) return;
+              host.failures = 0;
+              host.retryAt = 0;
+              if (out.items.length) finish(out);
+              else empty = out; // 正常な0件は他のホストの成功を妨げない
+            }).catch(() => {
+              if (settled) return; // レース敗者の中断は障害に数えない
+              host.failures += 1;
+              host.retryAt = this.now() + Math.min(this.cooldown * 2 ** Math.min(host.failures - 1, 4), 5 * 60 * 1000);
+            }).finally(() => {
+              active -= 1;
+              if (settled) return;
+              fill();
+              if (!active && index >= candidates.length) finish(empty || emptyResult(true));
+            });
+          }
+        };
+        hedgeTimer = setTimeout(() => { width = 2; fill(); }, this.hedgeMs);
+        deadlineTimer = setTimeout(() => finish(empty || emptyResult(true)), this.deadline);
+        fill();
+      });
+    }
+  }
+
+  /** 検索専用の取得順序。再生・コメント・トレンド等には配線しない。 */
+
+  const FILTER_NOTE = '絞り込みを適用できなかったため、条件なしの検索結果を表示しています。';
+  const hasItems = (out) => !!(out && Array.isArray(out.items) && out.items.length);
+
+  /** 空配列・例外が先に返っても、まだ動いている取得元の成功を待つ。 */
+  function firstWithItems(jobs) {
+    return new Promise((resolve) => {
+      let remaining = jobs.length;
+      if (!remaining) return resolve(null);
+      for (const job of jobs) {
+        Promise.resolve(job).catch(() => null).then((out) => {
+          remaining -= 1;
+          if (hasItems(out)) resolve(out);
+          else if (!remaining) resolve(null);
+        });
+      }
+    });
+  }
+
+  function mergeItems(base, extra, limit = 60) {
+    const items = [];
+    const seen = new Set();
+    for (const item of [...(base || []), ...(extra || [])]) {
+      if (!item || !item.id || seen.has(item.id)) continue;
+      seen.add(item.id);
+      items.push(item);
+      if (items.length >= limit) break;
+    }
+    return items;
+  }
+
+  /** 呼び出し・本文処理の両方を予算で制限し、後から失敗しても unhandled rejection にしない。 */
+  async function attempt(fn, timeout) {
+    if (timeout <= 0) return null;
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(fn).catch(() => null),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(null), timeout); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function resultOf(out, source, filterApplied = false) {
+    if (!hasItems(out)) return null;
+    const items = mergeItems(out.items, []);
+    return {
+      items,
+      source,
+      filterApplied,
+      hasMore: typeof out.hasMore === 'boolean' ? out.hasMore : !!out.continuation,
+      nextPage: Number.isSafeInteger(out.nextPage) ? out.nextPage : null,
+    };
+  }
+
+  class SearchResolver {
+    constructor({ primarySearch, wistaSearch, legacySearch, shouldRetry = () => false,
+      hedgeMs = 200, primaryTimeout = 3500, retryTimeout = 1200, legacyTimeout = 1500,
+      supplementWait = 300, deadline = 6500, ttl = 2 * 60 * 1000, now = () => Date.now() } = {}) {
+      this.primarySearch = primarySearch;
+      this.wistaSearch = wistaSearch;
+      this.legacySearch = legacySearch;
+      this.shouldRetry = shouldRetry;
+      this.hedgeMs = hedgeMs;
+      this.primaryTimeout = primaryTimeout;
+      this.retryTimeout = retryTimeout;
+      this.legacyTimeout = legacyTimeout;
+      this.supplementWait = supplementWait;
+      this.deadline = deadline;
+      this.now = now;
+      this.cache = new TtlCache({ max: 300, ttl, now });
+    }
+
+    async search(query, { page = 0, sp = '' } = {}) {
+      const key = JSON.stringify([query, page, sp]);
+      // 結果と同時リクエストを共有する（障害による0件はキャッシュしない）。
+      const out = await this.cache.wrap(key, undefined, async () => {
+        const result = await this._search(query, page, sp);
+        return hasItems(result) ? result : null;
+      });
+      return out || { items: [], source: 'none', filterApplied: false, hasMore: false, nextPage: null, page };
+    }
+
+    async _search(query, page, sp) {
+      const started = this.now();
+      const budget = (max) => Math.max(0, Math.min(max, this.deadline - (this.now() - started)));
+      const primary = (params, timeout) => attempt(
+        () => this.primarySearch(query, { page, sp: params || undefined, timeout }), timeout
+      ).then((out) => resultOf(out, 'innertube', !!params));
+
+      let remoteStarted = false;
+      let resolveRemote;
+      const remote = new Promise((resolve) => { resolveRemote = resolve; });
+      let hedgeTimer;
+      const startRemote = () => {
+        clearTimeout(hedgeTimer);
+        if (remoteStarted) return;
+        remoteStarted = true;
+        attempt(() => this.wistaSearch(query, { page }), budget(this.deadline))
+          .then((out) => resolveRemote(resultOf(out, 'wista')));
+      };
+
+      // InnerTube が即答すれば追加の外向き通信は不要。遅い／失敗なら Wista も使う。
+      const fast = primary(sp, budget(this.primaryTimeout));
+      hedgeTimer = setTimeout(startRemote, this.hedgeMs);
+      fast.then((out) => { if (!hasItems(out)) startRemote(); });
+      try {
+        // 絞り込み時は対応する InnerTube を優先する。無条件の Wista で条件を偽装しない。
+        let result = sp ? await fast : await firstWithItems([fast, remote]);
+        let retried = false;
+        if (!result && sp) {
+          startRemote();
+          retried = true;
+          result = await firstWithItems([remote, primary('', budget(this.retryTimeout))]);
+        }
+
+        if (!result && !retried && this.shouldRetry()) {
+          // YouTube本体に拒否されていない「通信経路の不通」のときだけ一度再挑戦。
+          result = await primary(sp, budget(this.retryTimeout));
+          if (result) result.source = 'innertube-retry';
+        }
+
+        // 少数でも得られた結果を長く待たせない。同じキーワードの Wista のみ短く待って補充。
+        // フィルター付きの結果には、条件なしの項目を混ぜない。
+        const MIN_ITEMS = 8;
+        if (result && result.source === 'innertube' && !sp && result.items.length < MIN_ITEMS) {
+          startRemote();
+          const extra = await attempt(() => remote, budget(this.supplementWait));
+          if (hasItems(extra)) {
+            const items = mergeItems(result.items, extra.items);
+            if (items.length > result.items.length) {
+              result = { ...result, items, source: 'mixed', hasMore: result.hasMore || extra.hasMore,
+                nextPage: result.nextPage || extra.nextPage };
+            }
+          }
+        }
+
+        if (!result && page === 0 && this.legacySearch) {
+          // GetListByKeyword の第4引数は page ではなく options。ページ2以降で
+          // これを使うと先頭を繰り返すため、従来経路は初回だけの最終保険にする。
+          const items = await attempt(() => this.legacySearch(query, 20, 0), budget(this.legacyTimeout));
+          result = resultOf({ items, hasMore: false }, 'legacy');
+        }
+
+        if (!result) return null;
+        if (sp && !result.filterApplied) result.filterNote = FILTER_NOTE;
+        const nextPage = result.nextPage > page ? result.nextPage : page + 1;
+        return { ...result, page, nextPage: result.hasMore && page < 100 ? nextPage : null,
+          hasMore: result.hasMore && page < 100 };
+      } finally {
+        clearTimeout(hedgeTimer);
+      }
+    }
+  }
+  return { WistaSearch, SearchResolver };
+})();
+/* SEARCH_ONLY_END */
+
+// Wista の5台は検索専用。ストリーム提供元の apiListCache には加えない。
+const wistaSearch = new WistaSearch({
+  fetchImpl: fetch,
+  enabled: process.env.WISTA_SEARCH !== "0",
+  bases: process.env.WISTA_SEARCH_URLS || undefined,
+  timeout: Math.min(10000, Math.max(300, Number(process.env.WISTA_SEARCH_TIMEOUT) || 2500)),
+});
+const searchResolver = new SearchResolver({
+  primarySearch: (query, { page, sp, timeout }) => fastMeta(
+    "search",
+    () => ytMeta.search(query, { page, sp }),
+    () => null,
+    { timeout }
+  ),
+  wistaSearch: (query, options) => wistaSearch.search(query, options),
+  legacySearch: (query, limit, page) => legacySearch(query, limit, page),
+  shouldRetry: () => YT_META_ENABLED && ytMeta && !ytMeta.isBlocked && ytMeta.state().transportFailures > 0,
+});
+
 // 動的レスポンス（HTML/JSON）は Service Worker にもブラウザにもキャッシュさせない。
 // キャッシュされると「動画ページに遷移できない / 古いストリームURLで再生できない」不具合になる。
 // ただしプロキシのフロントエンドは静的アセットなので、従来どおりキャッシュさせる。
@@ -622,77 +1051,27 @@ app.get("/api/trending", async (req, res) => {
 });
 
 
-app.get("/api/search", async (req, res, next) => {
-  const query = req.query.q;
-  const page = parseInt(req.query.page) || 0;
-  if (!query) return res.status(400).json({ error: "Query required" });
-
-  // 絞り込み（期間・長さ・種類・並び順）→ InnerTube の sp
+app.get("/api/search", async (req, res) => {
+  const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (!query) return res.status(400).json({ error: "Query required", items: [] });
+  if (query.length > 200) return res.status(400).json({ error: "Query too long (max 200 characters)", items: [] });
+  const rawPage = req.query.page === undefined ? "0" : req.query.page;
+  if (typeof rawPage !== "string" || !/^\d{1,3}$/.test(rawPage) || Number(rawPage) > 100) {
+    return res.status(400).json({ error: "page must be an integer between 0 and 100", items: [] });
+  }
+  const page = Number(rawPage);
   const filters = filtersFromQuery(req.query);
   const sp = buildSearchParams(filters);
-  const wanted = !!(filters.uploadDate || filters.type || filters.duration || filters.sort !== "relevance");
-
   try {
-    // 高速経路: search 1往復（キャッシュ済みなら0往復）。従来は公開ページのスクレイピング。
-    const fast = await fastMeta(
-      "search",
-      () => ytMeta.search(query, { page, sp: sp || undefined }),
-      () => null
-    );
-    const MIN_ITEMS = 8;
-    const reply = (items, extra = {}) =>
-      res.json({ items, filters, filterApplied: !!sp, ...extra });
-
-    let items = (fast && fast.items) || [];
-    let source = items.length ? "innertube" : "none";
-
-    // 絞り込みで0件なら、絞り込みなしでもう一度だけ試す。
-    // sp の値が YouTube 側で変わっても「何も出ない」よりはマシ。
-    if (!items.length && wanted && sp) {
-      const plain = await fastMeta(
-        "search",
-        () => ytMeta.search(query, { page }),
-        () => null
-      );
-      if (plain && plain.items && plain.items.length) {
-        return reply(plain.items, {
-          source: "innertube",
-          filterApplied: false,
-          filterNote: "絞り込みを外して再検索しました",
-        });
-      }
-    }
-
-    // プロキシが死んでいただけ（YouTube本体には拒否されていない）なら、
-    // プールが次のプロキシに回るので一度だけ再挑戦する。
-    if (!items.length && YT_META_ENABLED && ytMeta && !ytMeta.isBlocked && ytMeta.state().transportFailures > 0) {
-      const retry = await fastMeta(
-        "search",
-        () => ytMeta.search(query, { page, sp: sp || undefined }),
-        () => null
-      );
-      if (retry && retry.items && retry.items.length) {
-        items = retry.items;
-        source = "innertube-retry";
-      }
-    }
-
-    // それでも少なければ従来経路で補う（ブロック環境では呼ばれない）。
-    // 従来経路は絞り込みに対応していないので、その旨を返す（UIで告知するため）。
-    if (items.length < MIN_ITEMS) {
-      const extra = await legacySearch(query, 20, page);
-      if (extra.length) {
-        const merged = mergeItems(items, extra);
-        source = items.length ? "mixed" : "legacy";
-        items = merged;
-      }
-    }
-
-    return reply(items, { source, filterApplied: !!sp && source !== "legacy" });
+    // InnerTube / Wista（検索専用）/ 従来の検索を追加方式で併用する。
+    const out = await searchResolver.search(query, { page, sp });
+    rememberAvatars(out.items);
+    fillAvatars(out.items);
+    return res.json({ ...out, filters });
   } catch (err) {
-    // 取得元が全滅しても 500 の HTML を返さない（UI が静止するので 0 件で返す）
+    // 取得元が全滅しても 500 の HTML を返さない。
     console.error("Search API Error:", err && err.message);
-    res.json({ items: [], filters, filterApplied: false, source: "error" });
+    return res.json({ items: [], filters, filterApplied: false, source: "error", page, hasMore: false, nextPage: null });
   }
 });
 
