@@ -572,3 +572,36 @@ test('channel: 旧い channelMetadataRenderer でもアイコンと登録者数�
   assert.strictEqual(browses.length, 1, 'browse は1往復');
   assert.strictEqual(browses[0].body.browseId, 'UColdformatxxxxxxxxxxxxxx');
 });
+
+test('search: 途中の継続位置から正しいページまで補完する（page 2を使い回さない）', async () => {
+  const tokens = ['token-page-2', 'token-page-3', 'token-page-4'];
+  const fetchImpl = makeFetch(async ({ body }) => {
+    const page = tokens.indexOf(body.continuation) + 2;
+    assert.ok(page >= 2 && page <= 4);
+    return jsonRes(searchResponse([videoRenderer(String(page).padStart(11, '0'), `page ${page}`)], page < 4 ? tokens[page - 1] : null));
+  });
+  const yt = new YtMetadata({ fetchImpl, hedgeMs: 0 });
+  yt.cache.set('s:paging::tok:2', tokens[0]);
+  const out = await yt.search('paging', { page: 4 });
+  assert.strictEqual(out.items[0].title, 'page 4');
+  assert.deepStrictEqual(fetchImpl.calls.map(call => call.body.continuation), tokens);
+});
+
+test('search: 継続位置のない深いページは別のページを返さずに失敗させる', async () => {
+  const fetchImpl = makeFetch(async () => { throw new Error('unexpected outbound'); });
+  const yt = new YtMetadata({ fetchImpl, hedgeMs: 0 });
+  await assert.rejects(yt.search('cold', { page: 3 }), /continuation not available/);
+  assert.strictEqual(fetchImpl.calls.length, 0);
+});
+
+test('search: ページ結果が残っていれば、消えた継続位置を復元できる', async () => {
+  const fetchImpl = makeFetch(async ({ body }) => {
+    assert.strictEqual(body.continuation, 'next-token');
+    return jsonRes(searchResponse([videoRenderer('bbbbbbbbbbb', 'page 1')], null));
+  });
+  const yt = new YtMetadata({ fetchImpl, hedgeMs: 0 });
+  yt.cache.set('s:cached::0', { items: [], continuation: 'next-token' });
+  const out = await yt.search('cached', { page: 1 });
+  assert.strictEqual(out.items[0].title, 'page 1');
+  assert.strictEqual(fetchImpl.calls.length, 1);
+});
