@@ -34,6 +34,25 @@ const waitForServer = async (url, timeoutMs = 15000) => {
   throw new Error(`server did not start: ${url}`);
 };
 
+// healthz は上流に依存せず即答するため、モックのAPI一覧が入る前に動画を開くと
+// 実サービスのフォールバックが勝ってしまう。テストでは初期一覧の完了も待つ。
+const waitForApiList = (child) => new Promise((resolve, reject) => {
+  let output = '';
+  const cleanup = () => {
+    clearTimeout(timer);
+    child.stdout.removeListener('data', onData);
+    child.removeListener('exit', onExit);
+  };
+  const onData = (chunk) => {
+    output += chunk.toString();
+    if (output.includes('API List updated.')) { cleanup(); resolve(); }
+  };
+  const onExit = () => { cleanup(); reject(new Error('app exited before API list initialization')); };
+  const timer = setTimeout(() => { cleanup(); reject(new Error('API list initialization timeout')); }, 15000);
+  child.stdout.on('data', onData);
+  child.once('exit', onExit);
+});
+
 const get = (pathname, headers = {}) =>
   fetch(`http://127.0.0.1:${APP_PORT}${pathname}`, { headers, redirect: 'manual' });
 
@@ -57,9 +76,12 @@ test.before(async () => {
       YT_LEGACY_TIMEOUT: '300',
       NODE_ENV: 'test',
     },
-    stdio: 'ignore',
+    stdio: ['ignore', 'pipe', 'ignore'],
   });
-  await waitForServer(`http://127.0.0.1:${APP_PORT}/healthz`);
+  await Promise.all([
+    waitForServer(`http://127.0.0.1:${APP_PORT}/healthz`),
+    waitForApiList(app),
+  ]);
 });
 
 test.after(() => {
