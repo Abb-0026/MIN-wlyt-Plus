@@ -1507,6 +1507,52 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
     let isFetching = false;
     let currentPage = 0;
     let currentQuery = 'trending';
+    let nextContentPage = 0;
+    let hasMoreContent = true;
+    let emptyPageCount = 0;
+    let feedRequestId = 0;
+    let activeFeedController = null;
+
+    // 初回の再検索・絞り込み変更は、進行中の取得より優先する。
+    // 古い取得の finally が新しい検索のローディング状態を解除しないよう世代も持つ。
+    function beginFeedRequest(page) {
+      if (page > 0 && (isFetching || !hasMoreContent)) return null;
+      if (activeFeedController) activeFeedController.abort();
+      const request = { id: ++feedRequestId, controller: new AbortController() };
+      activeFeedController = request.controller;
+      isFetching = true;
+      loading.style.display = 'block';
+      if (page === 0) {
+        currentPage = 0;
+        nextContentPage = 0;
+        hasMoreContent = true;
+        emptyPageCount = 0;
+        displayedIds.clear();
+        videoGrid.innerHTML = '';
+        shortsRow.innerHTML = '';
+        shortsSection.style.display = 'none';
+        shortsExpanded = true;
+      }
+      return request;
+    }
+
+    function isCurrentFeedRequest(request) {
+      return request.id === feedRequestId && !request.controller.signal.aborted;
+    }
+
+    function finishFeedRequest(request) {
+      if (!isCurrentFeedRequest(request)) return;
+      isFetching = false;
+      activeFeedController = null;
+      loading.style.display = 'none';
+    }
+
+    function updateFeedPagination(page, data, added) {
+      emptyPageCount = page > 0 && added === 0 ? emptyPageCount + 1 : 0;
+      hasMoreContent = data.hasMore !== false && emptyPageCount < 2;
+      currentPage = page;
+      nextContentPage = Number.isSafeInteger(data.nextPage) && data.nextPage > page ? data.nextPage : page + 1;
+    }
 
     /* ── 検索の絞り込み（サーバ側の lib/search-filters.js と同じ一覧） ── */
     const SEARCH_FILTERS = {
@@ -1597,6 +1643,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       });
       document.getElementById('filterClear').addEventListener('click', () => {
         currentFilters = { sort: 'relevance', date: '', duration: '', type: '' };
+        history.replaceState(null, '', searchUrl(currentQuery));
         renderFilterBar();
         loadContent(currentQuery, 0);
       });
@@ -1605,6 +1652,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
         if (!btn) return;
         const key = btn.dataset.key;
         currentFilters[key] = btn.dataset.value;
+        history.replaceState(null, '', searchUrl(currentQuery));
         renderFilterBar();
         loadContent(currentQuery, 0);
       });
@@ -1625,21 +1673,38 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
       return arr;
     }
 
-    async function fetchEndpoint(endpoint) {
-      try {
-        const res = await fetch(endpoint);
-        if (!res.ok) return [];
-        const data = await res.json();
-        return data.items || [];
-      } catch (err) {
-        return [];
+    // items だけにしてしまうと filterNote / hasMore が失われるため、検索は応答全体を読む。
+    async function fetchFeedResponse(endpoint, { signal } = {}) {
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      if (signal) {
+        signal.addEventListener('abort', abort, { once: true });
+        if (signal.aborted) abort();
       }
+      const timer = setTimeout(abort, 12000);
+      try {
+        const res = await fetch(endpoint, { signal: controller.signal, cache: 'no-store', headers: { Accept: 'application/json' } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!data || !Array.isArray(data.items)) throw new Error('Invalid search response');
+        return data;
+      } catch (err) {
+        if (signal && signal.aborted) throw err;
+        return { items: [], hasMore: false, failed: true };
+      } finally {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', abort);
+      }
+    }
+
+    async function fetchEndpoint(endpoint, options) {
+      return (await fetchFeedResponse(endpoint, options)).items;
     }
 
     function normalizeAndFilterList(list) {
       const out = [];
-      for (const it of list) {
-        if (!it) continue;
+      for (const it of (Array.isArray(list) ? list : [])) {
+        if (!it || it.type === 'channel' || it.type === 'playlist') continue;
         let id = null;
         if (typeof it.id === 'string') id = it.id;
         else if (it.id && typeof it.id === 'object') {
@@ -1647,7 +1712,7 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
         } else if (it.videoId) { id = it.videoId; }
         if (!id) continue;
         id = String(id);
-        if (id.startsWith('UC')) continue;
+        if (!/^[A-Za-z0-9_-]{11}$/.test(id)) continue;
         it.id = id;
         out.push(it);
       }
@@ -1727,137 +1792,89 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
     }
 
     async function loadContent(query = 'trending', page = 0) {
-      if (isFetching) return;
-      isFetching = true;
-      loading.style.display = 'block';
-
-      if (page === 0) {
-        displayedIds.clear();
-        videoGrid.innerHTML = '';
-        shortsRow.innerHTML = '';
-        shortsSection.style.display = 'none';
-        shortsExpanded = true;
-      }
-
+      const request = beginFeedRequest(page);
+      if (!request) return;
+      const options = { signal: request.controller.signal };
       const isDefault = query === 'trending';
-      const endpoint = isDefault
-        ? `/api/trending?page=${page}`
-        : searchEndpoint(query, page);
+      const endpoint = isDefault ? `/api/trending?page=${page}` : searchEndpoint(query, page);
 
       try {
-        let items = await fetchEndpoint(endpoint);
-        filterNote = (items && items.filterNote) || '';
-        items = normalizeAndFilterList(items);
+        const data = await fetchFeedResponse(endpoint, options);
+        if (!isCurrentFeedRequest(request)) return;
+        filterNote = typeof data.filterNote === 'string' ? data.filterNote : '';
+        let items = normalizeAndFilterList(data.items);
 
-        if (page === 0) {
-          const MIN_ITEMS = 12;
-          if (items.length < MIN_ITEMS) {
-            const chips = Array.from(document.querySelectorAll('.chip'))
-              .map(c => c.dataset.q).filter(q => q && q !== query);
-            shuffleArray(chips);
-            const supplementPromises = [];
-            const maxSources = Math.min(4, chips.length);
-            for (let i = 0; i < maxSources; i++) {
-              const cat = chips[i];
-              const ep = cat === 'trending' ? `/api/trending?page=0` : `/api/search?q=${encodeURIComponent(cat)}&page=0`;
-              supplementPromises.push(fetchEndpoint(ep));
-            }
-            const supplementResults = await Promise.all(supplementPromises);
-            const combined = items.concat(...supplementResults.flat());
-            const filteredCombined = normalizeAndFilterList(combined);
-            const seen = new Set();
-            const deduped = [];
-            for (const it of filteredCombined) {
-              if (!it || !it.id) continue;
-              if (seen.has(it.id)) continue;
-              seen.add(it.id);
-              deduped.push(it);
-            }
-            items = shuffleArray(deduped);
-          }
+        // カテゴリによる補充はホームだけ。キーワード検索に無関係な動画を混ぜない。
+        if (page === 0 && isDefault && items.length < 12) {
+          const chips = Array.from(document.querySelectorAll('.chip'))
+            .map(c => c.dataset.q).filter(q => q && q !== query && q !== 'recommended');
+          const categories = shuffleArray(chips).slice(0, 4);
+          const supplements = await Promise.all(categories.map(cat => {
+            const ep = `/api/search?q=${encodeURIComponent(cat)}&page=0`;
+            return fetchEndpoint(ep, options);
+          }));
+          if (!isCurrentFeedRequest(request)) return;
+          const seen = new Set();
+          items = shuffleArray(normalizeAndFilterList(items.concat(...supplements)).filter(item => {
+            if (seen.has(item.id)) return false;
+            seen.add(item.id);
+            return true;
+          }));
         }
 
         renderFilterBar();
         const noteEl = document.getElementById('filterNote');
         if (noteEl) {
-          noteEl.textContent = filterNote || '';
+          noteEl.textContent = filterNote;
           noteEl.hidden = !filterNote;
         }
 
-        if (items.length === 0 && page === 0) {
-          videoGrid.innerHTML = '<p class="empty">動画が見つかりませんでした。</p>';
+        if (!items.length && page === 0) {
+          videoGrid.innerHTML = data.failed
+            ? '<p class="empty">検索に失敗しました。もう一度検索してください。</p>'
+            : '<p class="empty">動画が見つかりませんでした。</p>';
         }
 
-        let shorts = [];
-        const normals = [];
-        items.forEach(item => {
-          if (!item || !item.id) return;
-          const title = item.title || '';
-          if (title.includes('#')) shorts.push(item);
-          else normals.push(item);
-        });
+        const before = displayedIds.size;
+        const isShort = item => item.isShort === true || item.type === 'short' || /(?:^|\s)#shorts\b/i.test(item.title || '');
+        const shorts = isDefault && page === 0 ? items.filter(isShort) : [];
+        const showShorts = shorts.length > 4;
+        // 検索は関連度／指定した順序を保持する。ショートを別ページから先読みしない。
+        // 少数のショートも捨てず、通常のカードとして表示する。
+        const normals = showShorts ? items.filter(item => !isShort(item)) : items;
 
-        if (page === 0) {
-          if (currentQuery !== 'trending' && shorts.length > 0 && shorts.length <= 4) {
-            const needed = 6;
-            const addedShortIds = new Set(shorts.map(s => s.id));
-            for (let p = 1; p <= 3 && shorts.length < needed; p++) {
-              const ep = searchEndpoint(currentQuery, p);
-              try {
-                const resItems = await fetchEndpoint(ep);
-                const norm = normalizeAndFilterList(resItems);
-                for (const it of norm) {
-                  if (!it || !it.id || addedShortIds.has(it.id)) continue;
-                  if ((it.title || '').includes('#')) {
-                    shorts.push(it);
-                    addedShortIds.add(it.id);
-                    if (shorts.length >= needed) break;
-                  }
-                }
-              } catch (e) {}
-            }
-          }
-
-          if (shorts.length <= 4) {
-            shortsSection.style.display = 'none';
-          } else {
-            shortsSection.style.display = 'block';
-            shorts.forEach(item => {
-              if (!item || !item.id || displayedIds.has(item.id)) return;
-              displayedIds.add(item.id);
-              const a = document.createElement('a');
-              a.className = 'short-card';
-              a.href = `/video/${item.id}`;
-              const thumbUrl = getThumbUrl(item.id, 'hq');
-              const channel = item.channelTitle || '';
-              const viewText = item.viewCountText || '';
-              a.innerHTML = `
-                <div class="short-thumb">
-                  <img src="${esc(thumbUrl)}" loading="lazy" alt="${esc(item.title || 'ショート')}">
-                  <div class="short-overlay">
-                    <div class="short-title">${esc(item.title || '')}</div>
-                    <div class="short-views">${esc(viewText)}</div>
-                  </div>
+        if (showShorts) {
+          shortsSection.style.display = 'block';
+          shorts.forEach(item => {
+            if (displayedIds.has(item.id)) return;
+            displayedIds.add(item.id);
+            const a = document.createElement('a');
+            a.className = 'short-card';
+            a.href = `/video/${item.id}`;
+            a.innerHTML = `
+              <div class="short-thumb">
+                <img src="${esc(getThumbUrl(item.id, 'hq'))}" loading="lazy" alt="${esc(item.title || 'ショート')}">
+                <div class="short-overlay">
+                  <div class="short-title">${esc(item.title || '')}</div>
+                  <div class="short-views">${esc(item.viewCountText || '')}</div>
                 </div>
-              `;
-              shortsRow.appendChild(a);
-            });
-            updateShortsToggleUI();
-          }
+              </div>
+            `;
+            shortsRow.appendChild(a);
+          });
+          updateShortsToggleUI();
         }
 
         normals.forEach(item => {
-          if (!item || !item.id || displayedIds.has(item.id)) return;
+          if (displayedIds.has(item.id)) return;
           displayedIds.add(item.id);
-
           videoGrid.appendChild(createVideoCard(item));
         });
-
+        updateFeedPagination(page, { ...data, hasMore: data.hasMore === undefined ? items.length > 0 : data.hasMore }, displayedIds.size - before);
       } catch (err) {
-        console.error("Fetch error", err);
+        if (isCurrentFeedRequest(request)) console.error('Fetch error', err);
       } finally {
-        isFetching = false;
-        loading.style.display = 'none';
+        finishFeedRequest(request);
       }
     }
 
@@ -1878,12 +1895,11 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
     window.onscroll = () => {
       const scrollPos = window.innerHeight + window.scrollY;
       const threshold = document.documentElement.scrollHeight - 800;
-      if (scrollPos >= threshold && !isFetching) {
-        currentPage++;
+      if (scrollPos >= threshold && !isFetching && hasMoreContent) {
         if (isPersonalized) {
-          loadPersonalizedFeed(currentPage);
+          loadPersonalizedFeed(nextContentPage);
         } else {
-          loadContent(currentQuery, currentPage);
+          loadContent(currentQuery, nextContentPage);
         }
       }
     };
@@ -2176,17 +2192,9 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
 
     // パーソナライズフィードを構築（登録チャンネル＋履歴キーワードで検索、シャッフル混合）
     async function loadPersonalizedFeed(page = 0) {
-      if (isFetching) return;
-      isFetching = true;
-      loading.style.display = 'block';
-
-      if (page === 0) {
-        displayedIds.clear();
-        videoGrid.innerHTML = '';
-        shortsRow.innerHTML = '';
-        shortsSection.style.display = 'none';
-        shortsExpanded = true;
-      }
+      const request = beginFeedRequest(page);
+      if (!request) return;
+      const options = { signal: request.controller.signal };
 
       const subscribedChannels = getSubscribedChannels();
       const { channels: histChannels, titleWords } = getHistoryKeywords();
@@ -2197,10 +2205,8 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
 
       // キーワードがなければトレンドにフォールバック
       if (allKeywords.length === 0) {
-        isFetching = false;
-        loading.style.display = 'none';
-        loadContent('trending', page);
-        return;
+        finishFeedRequest(request);
+        return loadContent('trending', page);
       }
 
       try {
@@ -2209,11 +2215,13 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
         const pick = shuffled.slice((page % Math.max(shuffled.length, 1)) * 2, (page % Math.max(shuffled.length, 1)) * 2 + 3);
         const queries = pick.length > 0 ? pick : shuffled.slice(0, 3);
 
-        const promises = queries.map(q => fetchEndpoint(`/api/search?q=${encodeURIComponent(q)}&page=${Math.floor(page / Math.max(queries.length, 1))}`));
+        const promises = queries.map(q => fetchEndpoint(`/api/search?q=${encodeURIComponent(q)}&page=${page}`, options));
         // トレンドも少し混ぜる（page=0のみ）
-        if (page === 0) promises.push(fetchEndpoint(`/api/trending?page=0`));
+        if (page === 0) promises.push(fetchEndpoint(`/api/trending?page=0`, options));
 
         const results = await Promise.all(promises);
+        if (!isCurrentFeedRequest(request)) return;
+        const before = displayedIds.size;
         let items = normalizeAndFilterList(results.flat());
 
         // 重複除去
@@ -2225,15 +2233,13 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           videoGrid.innerHTML = '<p class="empty">動画が見つかりませんでした。</p>';
         }
 
-        const shorts = [], normals = [];
-        items.forEach(item => {
-          if (!item || !item.id) return;
-          if ((item.title || '').includes('#')) shorts.push(item);
-          else normals.push(item);
-        });
+        const isShort = item => item.isShort === true || item.type === 'short' || /(?:^|\s)#shorts\b/i.test(item.title || '');
+        const shorts = page === 0 ? items.filter(isShort) : [];
+        const showShorts = shorts.length > 4;
+        const normals = showShorts ? items.filter(item => !isShort(item)) : items;
 
-        // ショート表示（page=0のみ）
-        if (page === 0 && shorts.length > 4) {
+        // ショート表示（page=0のみ）。少数なら通常カードとして残す。
+        if (showShorts) {
           shortsSection.style.display = 'block';
           shorts.forEach(item => {
             if (displayedIds.has(item.id)) return;
@@ -2262,11 +2268,11 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
           videoGrid.appendChild(createVideoCard(item));
         });
 
+        updateFeedPagination(page, { hasMore: items.length > 0 }, displayedIds.size - before);
       } catch (err) {
-        console.error('Personalized feed error', err);
+        if (isCurrentFeedRequest(request)) console.error('Personalized feed error', err);
       } finally {
-        isFetching = false;
-        loading.style.display = 'none';
+        finishFeedRequest(request);
       }
     }
 
@@ -2288,6 +2294,19 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
         loadPersonalizedFeed(0);
       }
     };
+
+    // 戻る／進むでも検索語・絞り込み・検索結果を同じ状態に戻す。
+    window.addEventListener('popstate', () => {
+      filtersFromUrl();
+      const q = (new URLSearchParams(window.location.search).get('q') || '').trim();
+      currentQuery = q || 'trending';
+      searchInput.value = q;
+      isPersonalized = !q;
+      document.querySelectorAll('.chip').forEach(chip => chip.classList.remove('active'));
+      renderFilterBar();
+      if (q) loadContent(q, 0);
+      else loadPersonalizedFeed(0);
+    });
 
     // 外部フォントなど全リソースの読み込み完了を待たず、DOM解析直後にフィードを開始する。
     if (document.readyState === 'loading') {
@@ -3195,5 +3214,5 @@ if (!currentUrl.includes("projects") && !currentUrl.includes("private") && !curr
   </button>
 </nav>
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447" integrity="sha512-57MDmcccJXYtNnH+ZiBwzC4jb2rvgVCEokYN+L/nLlmO8rfYT/gIpW2A569iJ/3b+0UEasghjuZH/ma3wIs/EQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
-</body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4a722f449c261e3',t:'MTc5MTk4NjcwMQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
